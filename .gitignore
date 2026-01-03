@@ -1,0 +1,15 @@
+# GUTT
+.config/gutt/
+.cache/gutt/
+
+# Editors
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+*~
+
+# Shell
+*.swp
