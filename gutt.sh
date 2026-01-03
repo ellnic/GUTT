@@ -1154,31 +1154,339 @@ action_commit() {
     msgbox "No staged changes.\n\nStage files first."
     return 1
   fi
+
+  # Guided view: show status + staged summary before asking for the message.
+  local tmp br
+  tmp="$(mktemp)"
+  br="$(git_current_branch "$repo")"
+
+  (
+    cd "$repo" 2>/dev/null || exit 0
+    echo "Commit (guided)"
+    echo "==============="
+    echo
+    echo "repo   : $repo"
+    echo "branch : $br"
+    if [[ "$br" == "HEAD" || -z "$br" ]]; then
+      echo "note   : detached HEAD"
+    fi
+    echo
+    echo "Working tree (git status -sb):"
+    echo "------------------------------"
+    git status -sb 2>/dev/null || true
+    echo
+    echo "Staged files (git diff --cached --name-status):"
+    echo "----------------------------------------------"
+    git diff --cached --name-status 2>/dev/null || true
+    echo
+    echo "Staged diffstat (git diff --cached --stat):"
+    echo "------------------------------------------"
+    git diff --cached --stat 2>/dev/null || true
+  ) >"$tmp" 2>/dev/null || true
+
+  textbox "$tmp"
+  rm -f "$tmp"
+
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Commit (guided)" \
+      "VIEW" "View staged diff (full)" \
+      "GO"   "Proceed to commit message" \
+      "CANC" "Cancel")" || return 0
+
+    case "$choice" in
+      VIEW)
+        local tmpd lines
+        tmpd="$(mktemp)"
+        (cd "$repo" && git diff --cached 2>/dev/null) >"$tmpd" 2>/dev/null || true
+        lines="$(wc -l <"$tmpd" 2>/dev/null || echo 0)"
+        if [[ "$lines" -gt 2000 ]]; then
+          if ! yesno "Staged diff is large (${lines} lines).\n\nOpen anyway?" ; then
+            rm -f "$tmpd"
+            continue
+          fi
+        fi
+        textbox "$tmpd"
+        rm -f "$tmpd"
+        ;;
+      GO)
+        break
+        ;;
+      CANC)
+        return 0
+        ;;
+    esac
+  done
+
   local msg
   msg="$(inputbox "Commit message" "")" || return 1
   [[ -n "$msg" ]] || { msgbox "Empty commit message refused."; return 1; }
+  if ! yesno "Commit staged changes with this message?\n\n$msg" ; then
+    return 0
+  fi
+
   run_git_capture "$repo" git commit -m "$msg"
 }
 
-action_checkpoint_commit() {
+
+action_commit_preview() {
   local repo="$1"
-  local staged
-  staged="$(cd "$repo" && git diff --cached --name-only 2>/dev/null | head -n1 || true)"
-  if [[ -z "$staged" ]]; then
-    msgbox "No staged changes.\n\nStage files first."
-    return 1
+
+  # Preview only: no staging, no commits.
+  local br up counts ahead behind
+  br="$(git_current_branch "$repo")"
+  up="$(cd "$repo" && git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)"
+  ahead="?"
+  behind="?"
+  if [[ -n "$up" ]]; then
+    counts="$(cd "$repo" && git rev-list --left-right --count HEAD..."$up" 2>/dev/null || true)"
+    if [[ -n "$counts" ]]; then
+      ahead="${counts%%[[:space:]]*}"
+      behind="${counts##*[[:space:]]}"
+    fi
   fi
 
-  local msg
-  msg="$(inputbox "Checkpoint commit message (WIP)" "WIP: ")" || return 1
+  local tmp
+  tmp="$(mktemp)"
+  (
+    cd "$repo" 2>/dev/null || exit 0
+    echo "Commit preview (no changes made)"
+    echo "==============================="
+    echo
+    echo "repo   : $repo"
+    echo "branch : ${br:-?}"
+    if git_is_detached "$repo"; then
+      echo "note   : detached HEAD"
+    fi
+    if [[ -n "$up" ]]; then
+      echo "upstream: $up (ahead $ahead, behind $behind)"
+    else
+      echo "upstream: (none)"
+    fi
+    echo
 
-  # Trim whitespace for emptiness checks
+    echo "Working tree (git status -sb):"
+    echo "------------------------------"
+    git status -sb 2>/dev/null || true
+    echo
+
+    echo "Staged (cached) diffstat:"
+    echo "------------------------"
+    if git diff --cached --quiet 2>/dev/null; then
+      echo "(none)"
+    else
+      git diff --cached --stat 2>/dev/null || true
+    fi
+    echo
+
+    echo "Unstaged (working tree) diffstat:"
+    echo "--------------------------------"
+    if git diff --quiet 2>/dev/null; then
+      echo "(none)"
+    else
+      git diff --stat 2>/dev/null || true
+    fi
+    echo
+
+    echo "Untracked files:"
+    echo "---------------"
+    local any=0
+    while IFS= read -r f; do
+      any=1
+      printf '%s\n' "$f"
+    done < <(git ls-files --others --exclude-standard 2>/dev/null || true)
+    if [[ "$any" -eq 0 ]]; then
+      echo "(none)"
+    fi
+  ) >"$tmp" 2>/dev/null || true
+
+  textbox "$tmp"
+  rm -f "$tmp"
+
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Commit preview (no changes made)" \
+      "SDF" "View staged diff (full)" \
+      "UDF" "View unstaged diff (full)" \
+      "BACK" "Back")" || return 0
+
+    case "$choice" in
+      SDF)
+        local tmpd lines
+        tmpd="$(mktemp)"
+        (cd "$repo" && git diff --cached 2>/dev/null) >"$tmpd" 2>/dev/null || true
+        lines="$(wc -l <"$tmpd" 2>/dev/null || echo 0)"
+        if [[ "$lines" -gt 2000 ]]; then
+          if ! yesno "Staged diff is large (${lines} lines).\n\nOpen anyway?" ; then
+            rm -f "$tmpd"
+            continue
+          fi
+        fi
+        textbox "$tmpd"
+        rm -f "$tmpd"
+        ;;
+      UDF)
+        local tmpu lines
+        tmpu="$(mktemp)"
+        (cd "$repo" && git diff 2>/dev/null) >"$tmpu" 2>/dev/null || true
+        lines="$(wc -l <"$tmpu" 2>/dev/null || echo 0)"
+        if [[ "$lines" -gt 2000 ]]; then
+          if ! yesno "Unstaged diff is large (${lines} lines).\n\nOpen anyway?" ; then
+            rm -f "$tmpu"
+            continue
+          fi
+        fi
+        textbox "$tmpu"
+        rm -f "$tmpu"
+        ;;
+      BACK)
+        return 0
+        ;;
+    esac
+  done
+}
+
+
+action_commit_all() {
+  local repo="$1"
+  ensure_repo "$repo" || return 1
+
+  if ! repo_dirty "$repo"; then
+    msgbox "No changes to commit."
+    return 0
+  fi
+
+  # Guard thresholds (tune later if needed, but keep stable for now).
+  local COUNT_THRESHOLD=25
+  local LINES_THRESHOLD=2000
+
+  local tmp br
+  tmp="$(mktemp)"
+  br="$(git_current_branch "$repo")"
+
+  local count total_lines
+  count="$(cd "$repo" && git status --porcelain=v1 2>/dev/null | wc -l | tr -d ' ')"
+  total_lines="$(
+    cd "$repo" 2>/dev/null || exit 0
+    {
+      git diff --numstat 2>/dev/null || true
+      git diff --cached --numstat 2>/dev/null || true
+    } | awk '{ if ($1 != "-") a += $1; if ($2 != "-") d += $2 } END { print (a + d + 0) }'
+  )"
+
+  (
+    cd "$repo" 2>/dev/null || exit 0
+    echo "Repo: $repo"
+    echo "Branch: $br"
+    if git_is_detached "$repo"; then
+      echo "Note: detached HEAD"
+    fi
+    echo
+    echo "This will stage and commit ALL changes (including untracked)."
+    echo
+    echo "Summary:"
+    echo "  Entries (status lines): $count"
+    echo "  Approx. changed lines:  $total_lines  (adds+deletes; binary ignored)"
+    echo
+    echo "Working tree:"
+    git status -sb 2>/dev/null || true
+    echo
+    echo "Changes (porcelain):"
+    git status --porcelain=v1 2>/dev/null || true
+  ) >"$tmp"
+
+  textbox "Commit all (preview)" "$tmp"
+  rm -f "$tmp"
+
+  if [[ "${count:-0}" -ge "$COUNT_THRESHOLD" || "${total_lines:-0}" -ge "$LINES_THRESHOLD" ]]; then
+    local tok
+    tok="$(inputbox "Large change set detected.\n\nEntries: $count (>= $COUNT_THRESHOLD) or Lines: $total_lines (>= $LINES_THRESHOLD)\n\nType ALL to continue" "")" || return 1
+    [[ "$tok" == "ALL" ]] || { msgbox "Cancelled."; return 0; }
+  fi
+
+  if ! yesno "Stage and commit ALL changes in this repo?\n\nThis includes untracked files.\n\nProceed?" ; then
+    return 0
+  fi
+
+  run_git_capture "$repo" git add -A
+
+  # Reuse guided commit flow (shows staged/unstaged, lets you view staged diff, etc.).
+  action_commit "$repo"
+}
+
+
+action_checkpoint_commit() {
+  local repo="$1"
+
+  ensure_repo "$repo" || return 1
+  git_is_detached "$repo" && { msgbox "Detached HEAD."; return 1; }
+
+  # If nothing is dirty and nothing is staged, there's nothing to checkpoint.
+  if (cd "$repo" && git diff --quiet && git diff --cached --quiet); then
+    local untracked
+    untracked="$(cd "$repo" && git ls-files --others --exclude-standard 2>/dev/null | head -n1 || true)"
+    if [[ -z "$untracked" ]]; then
+      msgbox "Nothing to checkpoint.\n\nNo staged/unstaged/untracked changes."
+      return 0
+    fi
+  fi
+
+  # Show a short status overview (guided, read-only).
+  run_git_capture "$repo" git status -sb
+
+  # If nothing staged, offer to stage everything (default NO).
+  if (cd "$repo" && git diff --cached --quiet); then
+    if yesno "No staged changes.\n\nStage ALL current changes (git add -A) for a WIP checkpoint?\n\nDefault is NO." ; then
+      run_git_capture "$repo" git add -A
+    else
+      msgbox "Cancelled.\n\nStage files first, then retry."
+      return 0
+    fi
+  fi
+
+  # Re-check staged presence.
+  if (cd "$repo" && git diff --cached --quiet); then
+    msgbox "No staged changes.\n\nNothing to checkpoint."
+    return 0
+  fi
+
+  # Guard: if this is a huge change set, require an explicit typed token.
+  local COUNT_THRESHOLD=25
+  local LINES_THRESHOLD=2000
+  local count total_lines tmp
+  tmp="$(mktemp)"
+  # Count tracked changed entries in working tree + index.
+  (cd "$repo" && git status --porcelain) >"$tmp" 2>/dev/null || true
+  count="$(grep -c '^[ MADRCU?!]' "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+
+  total_lines=0
+  while IFS=$'\t' read -r a d _; do
+    [[ "$a" == "-" || "$d" == "-" ]] && continue
+    [[ -n "$a" ]] && total_lines=$((total_lines + a))
+    [[ -n "$d" ]] && total_lines=$((total_lines + d))
+  done < <(cd "$repo" && { git diff --numstat; git diff --cached --numstat; } 2>/dev/null || true)
+
+  if [[ "${count:-0}" -ge "$COUNT_THRESHOLD" || "${total_lines:-0}" -ge "$LINES_THRESHOLD" ]]; then
+    local tok
+    tok="$(inputbox "Large change set detected.\n\nEntries: $count (>= $COUNT_THRESHOLD) or Lines: $total_lines (>= $LINES_THRESHOLD)\n\nType WIP to continue" "")" || return 1
+    [[ "$tok" == "WIP" ]] || { msgbox "Cancelled."; return 0; }
+  fi
+
+  # Default message with timestamp (user can edit).
+  local default_msg msg
+  default_msg="WIP: checkpoint $(date '+%Y-%m-%d %H:%M')"
+  msg="$(inputbox "Checkpoint commit message (WIP)" "$default_msg")" || return 0
+
+  # Trim whitespace for emptiness checks.
   local msg_trim
   msg_trim="${msg//[[:space:]]/}"
+  if [[ -z "$msg_trim" ]]; then
+    msg="WIP: checkpoint"
+  fi
 
-  # If user leaves it blank (or just "WIP:"), pick a safe default.
-  if [[ -z "$msg_trim" || "$msg_trim" == "WIP:" ]]; then
-    msg="WIP checkpoint"
+  if ! yesno "Create a WIP checkpoint commit with this message?\n\n$msg\n\nProceed?" ; then
+    return 0
   fi
 
   run_git_capture "$repo" git commit -m "$msg"
@@ -1187,40 +1495,207 @@ action_checkpoint_commit() {
 
 action_amend() {
   local repo="$1"
+
   git_is_detached "$repo" && { msgbox "Detached HEAD."; return 1; }
-  if ! yesno "Amend the last commit?\n\nThis rewrites history.\n\nProceed?" ; then
-    return 0
+
+  # Ensure we actually have a commit to amend.
+  if ! (cd "$repo" && git rev-parse --verify HEAD >/dev/null 2>&1); then
+    msgbox "No commits yet. Nothing to amend."
+    return 1
   fi
-  run_git_capture "$repo" git commit --amend
+
+  # Show context first (read-only).
+  run_git_capture "$repo" git log -1 --oneline --decorate
+  run_git_capture "$repo" git status -sb
+
+  # Strong guard: explicit typed confirmation.
+  local typed
+  typed="$(inputbox "Type AMEND to continue" "")" || return 0
+  [[ "$typed" == "AMEND" ]] || { msgbox "Cancelled."; return 0; }
+
+  # Decide whether to include working-tree changes.
+  local choice
+  choice="$(menu "$APP_NAME $VERSION" "Amend last commit (repo: $repo)"     "KEEP" "Keep commit message (no edit)"     "EDIT" "Edit commit message (open editor)"     "CANC" "Cancel")" || return 0
+
+  case "$choice" in
+    KEEP)
+      # If the user has unstaged/staged changes and wants them included, they should stage first.
+      if yesno "Include ALL current changes (stage everything) before amending?
+
+Default is NO." ; then
+        run_git_capture "$repo" git add -A
+      fi
+      run_git_capture "$repo" git commit --amend --no-edit
+      ;;
+    EDIT)
+      if yesno "Include ALL current changes (stage everything) before amending?
+
+Default is NO." ; then
+        run_git_capture "$repo" git add -A
+      fi
+      run_git_capture "$repo" git commit --amend
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
+
 
 action_reword_last() {
   local repo="$1"
+
   git_is_detached "$repo" && { msgbox "Detached HEAD."; return 1; }
+
+  # Refuse if there is no HEAD yet (no commits).
+  (cd "$repo" && git rev-parse --verify HEAD >/dev/null 2>&1) || {
+    msgbox "No commits yet. Nothing to reword."
+    return 1
+  }
+
+  # Safety: refuse if anything is staged, to avoid accidentally amending content.
+  if ! (cd "$repo" && git diff --cached --quiet) ; then
+    msgbox "Staged changes detected.
+
+Reword-only refuses to proceed to avoid accidentally changing commit contents.
+
+Use: Amend last commit"
+    return 1
+  fi
+
+  # Context: show the last commit and its full message.
+  run_git_capture "$repo" git log -1 --oneline --decorate
+  local tmp
+  tmp="$(mktemp)"
+  (cd "$repo" && git log -1 --pretty=format:%B) >"$tmp" 2>&1 || true
+  textbox "$tmp"
+  rm -f "$tmp"
+
+  # Warn if working tree is dirty (unstaged changes or untracked files).
+  local dirty="NO"
+  if ! (cd "$repo" && git diff --quiet) ; then
+    dirty="YES"
+  fi
+  local untracked_count
+  untracked_count="$(cd "$repo" && git ls-files --others --exclude-standard | wc -l | tr -d ' ')"
+  if [[ "$dirty" == "YES" || "${untracked_count:-0}" -gt 0 ]] ; then
+    if ! yesno "Working tree is not clean (unstaged changes and/or untracked files present).
+
+That will NOT be included in the amended commit (because nothing is staged), but it can confuse reviews.
+
+Proceed anyway?" ; then
+      return 0
+    fi
+  fi
+
+  local current_subject
+  current_subject="$(cd "$repo" && git log -1 --pretty=%s 2>/dev/null || true)"
+
   local msg
-  msg="$(inputbox "New message for last commit" "")" || return 1
+  msg="$(inputbox "New message for last commit (reword only)" "$current_subject")" || return 1
   [[ -n "$msg" ]] || { msgbox "Empty message refused."; return 1; }
-  if ! yesno "Rewrite last commit message?\n\nThis rewrites history.\n\nProceed?" ; then
+
+  local token
+  token="$(inputbox "Type REWORD to confirm rewriting history" "")" || return 1
+  [[ "$token" == "REWORD" ]] || { msgbox "Cancelled."; return 0; }
+
+  if ! yesno "Reword last commit message?
+
+This rewrites history.
+If this commit was already pushed, you will likely need force-with-lease.
+
+Proceed?" ; then
     return 0
   fi
+
   run_git_capture "$repo" git commit --amend -m "$msg"
 }
+
+action_undo_last_soft() {
+  local repo="$1"
+
+  if ! git_is_repo "$repo"; then
+    msgbox "Not a git repo: $repo"
+    return 1
+  fi
+
+  local br
+  br="$(git_current_branch "$repo")"
+  if [[ "$br" == "HEAD" || -z "$br" ]]; then
+    msgbox "Detached HEAD detected.
+
+Undo last commit refuses to proceed on detached HEAD."
+    return 1
+  fi
+
+  if ! (cd "$repo" && git rev-parse --verify HEAD >/dev/null 2>&1); then
+    msgbox "No commits found in this repo.
+
+Nothing to undo."
+    return 1
+  fi
+
+  # Safety: avoid mixing the undone commit with other local changes.
+  if git_has_changes "$repo"; then
+    msgbox "Working tree is not clean.
+
+Undo last commit (soft) refuses to proceed to avoid mixing changes.
+Commit/stash/discard your current changes first."
+    return 1
+  fi
+
+  if ! (cd "$repo" && git rev-parse --verify HEAD~1 >/dev/null 2>&1); then
+    msgbox "This repo appears to have only a single commit.
+
+Undo last commit (soft) needs HEAD~1.
+Use the Reset menu (advanced) if you truly need to rewrite the root commit."
+    return 1
+  fi
+
+  # Context
+  run_git_capture "$repo" git log -2 --oneline --decorate
+
+  local token
+  token="$(inputbox "Type UNDO to confirm rewriting history" "")" || return 1
+  [[ "$token" == "UNDO" ]] || { msgbox "Cancelled."; return 0; }
+
+  if ! yesno "Undo last commit (SOFT reset)?
+
+This rewrites history.
+It moves HEAD back by 1 commit and keeps the undone commit's changes STAGED.
+
+If this commit was already pushed, you will likely need force-with-lease.
+
+Proceed?" ; then
+    return 0
+  fi
+
+  run_git_capture "$repo" git reset --soft HEAD~1
+  run_git_capture "$repo" git status -sb
+}
+
 
 action_commit_menu() {
   local repo="$1"
   while true; do
     local choice
     choice="$(menu "$APP_NAME $VERSION" "Commit (repo: $repo)" \
+      "PRE" "Preview staged / unstaged (no commit)" \
       "COM" "Commit (requires staged changes)" \
+      "ALL" "Commit all (stage everything) (guarded)" \
       "WIP" "Checkpoint (WIP) commit" \
       "AMD" "Amend last commit" \
       "MSG" "Edit last commit message only" \
+      "UND" "Undo last commit (soft reset) (guarded)" \
       "BACK" "Back")" || return 0
     case "$choice" in
+      PRE) action_commit_preview "$repo" ;;
       COM) action_commit "$repo" ;;
+      ALL) action_commit_all "$repo" ;;
       WIP) action_checkpoint_commit "$repo" ;;
       AMD) action_amend "$repo" ;;
       MSG) action_reword_last "$repo" ;;
+      UND) action_undo_last_soft "$repo" ;;
       BACK) return 0 ;;
     esac
   done
