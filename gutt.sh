@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# GUTT - Git User TUI Tool (v0.3.0)
+# GUTT - Git User TUI Tool (v0.3.2)
 # Safe, guided Git TUI using whiptail.
 # Focus: common Git workflows + strong safeguards against destructive actions.
+#
+# v0.3.2 highlights:
+# - classic menu push now offers push options (current branch / all branches)
+# - squash-merge flow uses the same push helper as the menus
+
+# v0.3.1 highlights:
+# - improved upstream manager (view/set/pick/unset)
 #
 # v0.3.0 highlights:
 # - remembers repos + settings in ~/.config/gutt/
@@ -12,7 +19,7 @@
 
 set -Eeuo pipefail
 
-VERSION="v0.3.0"
+VERSION="v0.3.2"
 APP_NAME="GUTT"
 CFG_DIR="${HOME}/.config/gutt"
 CACHE_DIR="${HOME}/.cache/gutt"
@@ -867,6 +874,32 @@ action_pull() {
   esac
 }
 
+action_fetch() {
+  local repo="$1"
+  local remotes tmpf rc
+
+  remotes="$(cd "$repo" && git remote 2>/dev/null || true)"
+  if [[ -z "$remotes" ]]; then
+    msgbox "No remotes are configured for this repo.
+
+Add a remote first (Remotes menu)."
+    return 1
+  fi
+
+  tmpf="$(mktemp)"
+  (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
+  rc=$?
+  textbox "$tmpf"
+  rm -f "$tmpf"
+
+  if [[ $rc -eq 0 ]]; then
+    msgbox "Fetch completed successfully."
+  else
+    msgbox "Fetch failed."
+  fi
+  return $rc
+}
+
 action_pull_safe_update() {
   local repo="$1"
   local branch upstream tmpf rc
@@ -1029,23 +1062,319 @@ Review the output for details."
 }
 
 
+
+vnext_push_menu() {
+  local repo="$1"
+  local branch upstream
+
+  branch="$(git_current_branch "$repo")"
+  if [[ -z "$branch" ]]; then
+    msgbox "Not a git repo (or cannot read current branch)."
+    return 1
+  fi
+  if [[ "$branch" == "HEAD" ]]; then
+    msgbox "Cannot push from a detached HEAD.\n\nCheck out a branch first."
+    return 1
+  fi
+
+  upstream="$(git_upstream "$repo")"
+
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Push\n\nRepo:\n$repo\n\nBranch: $branch\nUpstream: ${upstream:-"(none)"}" \
+      "CUR"  "Push current branch" \
+      "ALL"  "Push all branches (advanced)" \
+      "BACK" "Back")" || return 0
+
+    case "$choice" in
+      CUR) vnext_push_current_branch "$repo" ;;
+      ALL) vnext_push_all_branches "$repo" ;;
+      BACK) return 0 ;;
+    esac
+
+    # refresh upstream display after actions
+    upstream="$(git_upstream "$repo")"
+  done
+}
+
+vnext_push_current_branch() {
+  local repo="$1"
+  local branch upstream remote cmd
+
+  branch="$(git_current_branch "$repo")"
+  if [[ -z "$branch" ]]; then
+    msgbox "Not a git repo (or cannot read current branch)."
+    return 1
+  fi
+  if [[ "$branch" == "HEAD" ]]; then
+    msgbox "Cannot push from a detached HEAD.\n\nCheck out a branch first."
+    return 1
+  fi
+
+  upstream="$(git_upstream "$repo")"
+
+  if [[ -n "$upstream" ]]; then
+    if ! yesno "Push current branch now?\n\nBranch: $branch\nUpstream: $upstream\n\nThis will run:\n  git push\n\nProceed?"; then
+      msgbox "Cancelled."
+      return 0
+    fi
+    cmd=(git push)
+  else
+    # Prefer origin if present, else fall back to the first remote.
+    if (cd "$repo" && git remote 2>/dev/null | grep -qx "origin"); then
+      remote="origin"
+    else
+      remote="$(cd "$repo" && git remote 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ -z "$remote" ]]; then
+      msgbox "No remotes found.\n\nAdd a remote first (for example: origin)."
+      return 1
+    fi
+
+    if ! yesno "No upstream is set for this branch.\n\nBranch: $branch\nUpstream: (none)\n\nSet upstream to:\n  ${remote}/${branch}\n\nand push now?\n\nThis will run:\n  git push -u $remote $branch\n\nProceed?"; then
+      msgbox "Cancelled."
+      return 0
+    fi
+
+    cmd=(git push -u "$remote" "$branch")
+  fi
+
+  # Optional fetch first (safer push feedback).
+  if [[ "$(cfg_get auto_fetch_before_push 1)" == "1" ]]; then
+    local tmpf rc
+    tmpf="$(mktemp)"
+    (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+      textbox "$tmpf"
+      rm -f "$tmpf"
+      msgbox "Fetch failed. Push aborted."
+      return $rc
+    fi
+    rm -f "$tmpf"
+  fi
+
+  local tmpp rc
+  tmpp="$(mktemp)"
+  (cd "$repo" && "${cmd[@]}") >"$tmpp" 2>&1
+  rc=$?
+  textbox "$tmpp"
+  rm -f "$tmpp"
+
+  if [[ $rc -eq 0 ]]; then
+    msgbox "Push completed successfully."
+  else
+    msgbox "Push failed.\n\nReview the output for details."
+  fi
+  return $rc
+}
+
+vnext_push_all_branches() {
+  local repo="$1"
+  local remote
+
+  # Prefer origin if present, else fall back to the first remote.
+  if (cd "$repo" && git remote 2>/dev/null | grep -qx "origin"); then
+    remote="origin"
+  else
+    remote="$(cd "$repo" && git remote 2>/dev/null | head -n1 || true)"
+  fi
+
+  if [[ -z "$remote" ]]; then
+    msgbox "No remotes found.\n\nAdd a remote first (for example: origin)."
+    return 1
+  fi
+
+  if ! yesno "Push ALL local branches to '$remote'?\n\nThis is advanced and can create lots of remote branches.\n\nThis will run:\n  git push $remote --all\n\nProceed?"; then
+    msgbox "Cancelled."
+    return 0
+  fi
+
+  # Optional fetch first (consistency / feedback).
+  if [[ "$(cfg_get auto_fetch_before_push 1)" == "1" ]]; then
+    local tmpf rc
+    tmpf="$(mktemp)"
+    (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+      textbox "$tmpf"
+      rm -f "$tmpf"
+      msgbox "Fetch failed. Push aborted."
+      return $rc
+    fi
+    rm -f "$tmpf"
+  fi
+
+  local tmpp rc
+  tmpp="$(mktemp)"
+  (cd "$repo" && git push "$remote" --all) >"$tmpp" 2>&1
+  rc=$?
+  textbox "$tmpp"
+  rm -f "$tmpp"
+
+  if [[ $rc -eq 0 ]]; then
+    msgbox "Push (all branches) completed successfully."
+  else
+    msgbox "Push (all branches) failed.\n\nReview the output for details."
+  fi
+  return $rc
+}
+
+
 action_set_upstream() {
   local repo="$1"
-  local branch remote
+  local branch upstream
+
   branch="$(git_current_branch "$repo")"
   if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
-    msgbox "Cannot set upstream on a detached HEAD."
+    msgbox "Cannot manage upstream on a detached HEAD."
     return 1
   fi
-  remote="$(cd "$repo" && git remote 2>/dev/null | head -n1 || true)"
-  if [[ -z "$remote" ]]; then
-    msgbox "No remotes found. Add a remote first."
-    return 1
-  fi
-  local target="${remote}/${branch}"
-  if yesno "Set upstream for '$branch' to:\n\n$target\n\nProceed?" ; then
-    run_git_capture "$repo" git push --set-upstream "$remote" "$branch"
-  fi
+
+  upstream="$(git_upstream "$repo")"
+
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Upstream (tracking)
+
+Repo:
+$repo
+
+Branch: $branch
+Current upstream: ${upstream:-"(none)"}" \
+      "VIEW" "View upstream details" \
+      "AUTO" "Set upstream to origin/<branch> and publish (push -u)" \
+      "PICK" "Set upstream to an existing remote branch (pick)" \
+      "UNST" "Unset upstream (guarded)" \
+      "BACK" "Back")" || return 0
+
+    case "$choice" in
+      VIEW)
+        local tmp; tmp="$(mktemp)"
+        {
+          echo "Branch:   $branch"
+          echo "Upstream: ${upstream:-"(none)"}"
+          echo
+          echo "Local HEAD:  $(cd "$repo" && git rev-parse --short HEAD 2>/dev/null || true)"
+          if [[ -n "$upstream" ]]; then
+            echo "Remote HEAD: $(cd "$repo" && git rev-parse --short "$upstream" 2>/dev/null || true)"
+          fi
+        } >"$tmp"
+        textbox "$tmp"
+        rm -f "$tmp"
+        ;;
+      AUTO)
+        local remote="origin"
+        if ! (cd "$repo" && git remote 2>/dev/null | grep -qx "origin"); then
+          remote="$(cd "$repo" && git remote 2>/dev/null | head -n1 || true)"
+        fi
+        if [[ -z "$remote" ]]; then
+          msgbox "No remotes found. Add a remote first."
+        else
+          if whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Publish '$branch' and set upstream to:
+
+${remote}/${branch}
+
+This will run:
+  git push -u $remote $branch
+
+Proceed?" 16 78 3>&1 1>&2 2>&3; then
+            run_git_capture "$repo" git push -u "$remote" "$branch"
+          else
+            msgbox "Cancelled."
+          fi
+        fi
+        ;;
+      PICK)
+        # Pick a remote, then pick an existing remote branch, then set tracking.
+        local remote
+        remote="$(cd "$repo" && git remote 2>/dev/null | head -n1 || true)"
+        if [[ -z "$remote" ]]; then
+          msgbox "No remotes found. Add a remote first."
+        fi
+
+        # If multiple remotes exist, let the user choose.
+        local rems=()
+        while IFS= read -r r; do
+          [[ -n "$r" ]] || continue
+          rems+=("$r" "" )
+        done < <(cd "$repo" && git remote 2>/dev/null || true)
+
+        if (( ${#rems[@]} > 2 )); then
+          remote="$(menu "$APP_NAME $VERSION" "Choose remote" "${rems[@]}" "BACK" "Back")" || { upstream="$(git_upstream "$repo")"; continue; }
+          [[ "$remote" == "BACK" ]] && { upstream="$(git_upstream "$repo")"; continue; }
+        else
+          remote="${rems[0]:-$remote}"
+        fi
+
+        local tmpb; tmpb="$(mktemp)"
+        (cd "$repo" && git for-each-ref "refs/remotes/${remote}/" --format='%(refname:short)') >"$tmpb" 2>/dev/null || true
+        if [[ ! -s "$tmpb" ]]; then
+          rm -f "$tmpb"
+          msgbox "No remote branches found under '${remote}/'.
+
+Tip: Fetch first, or publish with 'AUTO' to create ${remote}/${branch}."
+        fi
+
+        local items=()
+        while IFS= read -r rb; do
+          [[ -n "$rb" ]] || continue
+          # Skip remote HEAD pseudo ref if it appears.
+          [[ "$rb" == "${remote}/HEAD" ]] && continue
+          items+=("$rb" "" )
+        done <"$tmpb"
+        rm -f "$tmpb"
+
+        if (( ${#items[@]} == 0 )); then
+          msgbox "No selectable remote branches found."
+        fi
+
+        local target
+        target="$(menu "$APP_NAME $VERSION" "Choose upstream target for '$branch'" "${items[@]}" "BACK" "Back")" || { upstream="$(git_upstream "$repo")"; continue; }
+        [[ "$target" == "BACK" ]] && { upstream="$(git_upstream "$repo")"; continue; }
+
+        if whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Set upstream for:
+  $branch
+
+to:
+  $target
+
+This will run:
+  git branch --set-upstream-to=$target $branch
+
+Proceed?" 17 78 3>&1 1>&2 2>&3; then
+          run_git_capture "$repo" git branch --set-upstream-to="$target" "$branch"
+        else
+          msgbox "Cancelled."
+        fi
+        ;;
+      UNST)
+        if [[ -z "$upstream" ]]; then
+          msgbox "No upstream is set for '$branch'."
+        else
+          if whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Unset upstream for '$branch'?
+
+Current upstream:
+  $upstream
+
+This will run:
+  git branch --unset-upstream $branch
+
+Proceed?" 16 78 3>&1 1>&2 2>&3; then
+            run_git_capture "$repo" git branch --unset-upstream "$branch"
+          else
+            msgbox "Cancelled."
+          fi
+        fi
+        ;;
+      BACK)
+        return 0
+        ;;
+    esac
+
+    upstream="$(git_upstream "$repo")"
+  done
 }
 
 # -------------------------
@@ -2237,12 +2566,26 @@ action_clean_untracked() {
 action_force_push() {
   local repo="$1"
   git_is_detached "$repo" && { msgbox "Detached HEAD."; return 1; }
+  refuse_if_dirty "$repo" "force push" || return 1
 
-  local mode phrase u
+  local mode phrase u remote
   mode="$(cfg_get force_push_mode force-with-lease)"
+  case "$mode" in
+    force-with-lease|force) ;;
+    *) mode="force-with-lease" ;;
+  esac
+
   phrase="$(cfg_get confirm_phrase_forcepush OVERWRITE REMOTE)"
   u="$(git_upstream "$repo")"
-  [[ -n "$u" ]] || { msgbox "No upstream set.\n\nSet upstream first."; return 1; }
+  [[ -n "$u" ]] || { msgbox "No upstream set.
+
+Set upstream first."; return 1; }
+
+  remote="${u%%/*}"
+  [[ -n "$remote" ]] || remote="origin"
+
+  # Refresh remote tracking info so the summary is meaningful
+  ( cd "$repo" && git fetch "$remote" --prune >/dev/null 2>&1 ) || true
 
   local tmp; tmp="$(mktemp)"
   {
@@ -2250,14 +2593,26 @@ action_force_push() {
     echo
     echo "Upstream: $u"
     echo "Local HEAD:   $(cd "$repo" && git rev-parse --short HEAD 2>/dev/null || true)"
-    echo "Remote HEAD:  $(cd "$repo" && git rev-parse --short "$u" 2>/dev/null || true)"
+    echo "Remote HEAD:  $(cd "$repo" && git rev-parse --short "$u" 2>/dev/null || echo "(unknown - fetch failed or ref missing)")"
+    echo
+    local behind ahead
+    behind="$(cd "$repo" && git rev-list --left-right --count "$u...HEAD" 2>/dev/null | awk '{print $1}' || echo "?")"
+    ahead="$(cd "$repo" && git rev-list --left-right --count "$u...HEAD" 2>/dev/null | awk '{print $2}' || echo "?")"
+    echo "Ahead/behind (local vs upstream): +$ahead / -$behind"
     echo
     echo "This can overwrite remote history."
+    echo
+    echo "Command:"
+    echo "  git push --$mode"
   } >"$tmp"
   textbox "$tmp"
   rm -f "$tmp"
 
-  confirm_phrase "Final confirmation required.\n\nForce pushing can overwrite remote history." "$phrase" || { msgbox "Cancelled."; return 0; }
+  confirm_phrase "Final confirmation required.
+
+This can overwrite remote history.
+
+Type the phrase to continue:" "$phrase" || { msgbox "Cancelled."; return 0; }
   danger_preflight "$repo" "Force push to $u" || return 0
   offer_backup_tag "$repo"
   run_git_capture "$repo" git push --"$mode"
@@ -2279,7 +2634,7 @@ action_no_paper_trail() {
   [[ -n "$new" ]] || return 0
 
   phrase="$(cfg_get confirm_phrase_forcepush OVERWRITE REMOTE)"
-  confirm_phrase "This rewrites local history.\n\nIf remote has commits, you will also need Force Push.\n\nContinue?" "$phrase" || { msgbox "Cancelled."; return 0; }
+  confirm_phrase "This rewrites local history.\n\nIf the remote already has commits, you may need a force push afterwards.\n\nType the phrase to continue:" "$phrase" || { msgbox "Cancelled."; return 0; }
 
   local tmp; tmp="$(mktemp)"
   (
@@ -2519,7 +2874,7 @@ vnext_squash_merge_into_main() {
 
   # Optional push main (default NO)
   if whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Push '$main' to origin now?" 12 78 3>&1 1>&2 2>&3; then
-    action_push "$repo"
+    vnext_push_current_branch "$repo"
   fi
 
   rm -f "$logtmp"
@@ -2583,7 +2938,7 @@ vnext_common_menu() {
       STAT) action_status_summary "$repo" ;;
       PULL) action_pull_safe_update "$repo" ;;
       COMM) action_checkpoint_commit "$repo" ;;
-      PUSH) action_push "$repo" ;;
+      PUSH) vnext_push_menu "$repo" ;;
       CFB)  vnext_create_feature_branch "$repo" ;;
       SWB)  action_branch_switch "$repo" ;;
       SQM)  vnext_squash_merge_into_main "$repo" ;;
@@ -3210,15 +3565,17 @@ vnext_sync_menu() {
   while true; do
     local choice
     choice="$(menu "$APP_NAME $VERSION" "Sync (Pull/Push/Fetch)\n\nRepo:\n$repo" \
-      "PULL" "Pull" \
+      "PULL" "Pull (fast-forward only)" \
+      "FETC" "Fetch" \
       "PUSH" "Push" \
       "UPST" "Set / view upstream" \
       "FFPS" "Force push (with lease) (guarded)" \
       "BACK" "Back")" || return 0
 
     case "$choice" in
-      PULL) action_pull "$repo" ;;
-      PUSH) action_push "$repo" ;;
+      PULL) action_pull_safe_update "$repo" ;;
+      FETC) action_fetch "$repo" ;;
+      PUSH) vnext_push_menu "$repo" ;;
       UPST) action_set_upstream "$repo" ;;
       FFPS) action_force_push "$repo" ;;
       BACK) return 0 ;;
@@ -3352,8 +3709,8 @@ main_menu() {
       REM)  action_remote_menu "$repo" ;;
       LOG)  action_log_menu "$repo" ;;
       HYG)  action_hygiene_menu "$repo" ;;
-      PULL) action_pull "$repo" ;;
-      PUSH) action_push "$repo" ;;
+      PULL) action_pull_safe_update "$repo" ;;
+      PUSH) vnext_push_menu "$repo" ;;
       UPST) action_set_upstream "$repo" ;;
       DANG) action_danger_menu "$repo" ;;
       SETT) action_settings_menu ;;

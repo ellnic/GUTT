@@ -2,74 +2,64 @@
 
 ![GUTT TUI main menu](gutt_menu.png)
 
-**Status:** 🚧 **WIP / Alpha — Major internal refactor in progress**
+**Status:** 🚧 **WIP / Alpha**
 
-GUTT wraps the *common 90%* of Git usage in a protective, terminal-based interface with strong safeguards against destructive mistakes.
-
-> **Project note**
->
-> GUTT is usable today, but it is in the middle of a deliberate, large-scale internal refactor.
-> Core safety scaffolding and several major areas are complete; other areas are being rebuilt next.
-> This is intentional engineering work, not churn.
+GUTT wraps the common 90% of Git usage in a protective, terminal-based interface with strong safeguards against destructive mistakes.
 
 ---
 
-## What it does (high level)
-- Repo picker with memory (recent + last)
-- Status dashboard (branch, upstream, ahead/behind, staged/untracked)
-- Stage / unstage / discard
+## What it does
+- Repository picker with memory (recent and last used)
+- Status dashboard (branch, upstream, ahead or behind, staged and untracked)
+- Stage, unstage, and discard helpers
 - Commit helpers (amend, reword, undo last commit)
 - Branch management (guarded)
-- Stash management
-- Remotes & upstream helpers
-- Logs & diffs
+- Remote and upstream helpers
+- Logs and diffs
 - Hygiene assistant (.gitignore suggestions)
-- **Danger zone**: reset, clean, reflog, force-push (with lease), tidy-history baseline (all guarded)
+- **Danger zone**: reset, clean, reflog, force-push with lease, tidy-history baseline (all guarded)
 
 ---
 
-## Refactor progress snapshot
+## Current development status
 
-This refactor restructures GUTT internally for clarity, safety, and long-term maintainability.
-The list below is a **progress overview**, not a promise or timeline.
+GUTT is undergoing a structured internal refactor focused on safety, clarity, and long-term maintainability.
 
-### Completed
+### Stable and available
 - Core safety scaffolding and guard rails
-- Repo discovery, selection, and memory
-- Status & inspection tooling
+- Repository discovery, selection, and memory
+- Status and inspection tooling
 - Branch management (list, create, switch, rename, delete, prune, upstream tracking)
+- Fetch, pull, and push operations with guarded variants
 
-### In progress
+### Actively expanding
 - Commit workflows and helpers
-- Sync operations (fetch / pull / push variants)
 
-### Planned
-- Merge and rebase workflows (guided, guarded)
-- Stash workflows (full lifecycle)
-- Tags and release helpers
-- Hygiene & cleanup tools
-- Recovery and dangerous operations consolidation
+### Upcoming
+- Guided merge and rebase workflows
+- Full stash lifecycle support
+- Tag and release helpers
+- Hygiene and cleanup tools
+- Recovery and high-risk operation helpers
 - Settings, help, and documentation polish
 
 ---
 
 ## Safety principles
 - **Refuses to run as root**
-- Refuses destructive actions on dirty repos
+- Refuses destructive actions on dirty repositories
 - Dry-runs before deletes
-- Typed confirmation phrases for history rewrites / force-push
+- Typed confirmation phrases for history rewrites and force-push
 - Defaults to **NO** for all destructive prompts
-- Optional local safety tags before danger operations
+- Optional local safety tags before dangerous operations
 
-GUTT does not try to make Git “safe”.
-It makes *intent explicit* and mistakes harder.
+GUTT does not try to make Git safe. It makes intent explicit and mistakes harder. *You can still destroy your repos if you do not know what you are doing.*
 
 ---
 
 ## Why?
-- It’s for **git**, not “GitHub” or “GitLab”
-- Vendor websites and native apps often get in the way
-- A terminal-first workflow deserves first-class tooling
+- It is for **Git**, not hosting platforms
+- Web UIs and vendor tooling often get in the way
 - Why not?
 
 ---
@@ -89,18 +79,28 @@ chmod +x gutt.sh
 
 ---
 
-## Config & data
-Stored per-user:
+## Config and data
+Stored per user:
 - `~/.config/gutt/config`
 - `~/.config/gutt/repos.list`
 - `~/.cache/gutt/`
 
 ---
 
-## Disclaimer
-This tool can still **destroy Git history if you tell it to**.
+## Project Status and Disclaimer ⚠️
 
-It is designed to slow you down, surface intent, and make consequences obvious —
-not to protect you from yourself.
+**GUTT IS CURRENTLY IN ACTIVE DEVELOPMENT AND SHOULD BE CONSIDERED ALPHA SOFTWARE. GUTT MAY CONTAIN BUGS THAT COULD LEAD TO REPOSITORY DAMAGE OR DATA LOSS. YOU SHOULD REVIEW THE CODE YOURSELF BEFORE RUNNING IT. THIS TOOL IS PROVIDED WITH ABSOLUTELY NO WARRANTY, EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE. YOU USE THIS TOOL ENTIRELY AT YOUR OWN RISK. THE SCRIPT IS PROVIDED "AS IS" AND IN GOOD FAITH WITH THE INTENT OF ASSISTING SAFE, INTENTIONAL GIT USAGE.**
 
-Use with care. Feedback welcome.
+---
+
+## Transparency note 🤖
+
+Some parts of this project are developed with the assistance of AI tools.  
+All logic, safety decisions, and final changes are reviewed, tested, and curated by the project author.  
+AI assistance is used as a productivity aid, not as an autonomous decision-maker.
+
+---
+
+## Licence 📄
+
+GUTT is released under the GNU General Public License v3.0 or later.
