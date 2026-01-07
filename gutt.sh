@@ -1,25 +1,9 @@
 #!/usr/bin/env bash
-# GUTT - Git User TUI Tool (v0.3.2)
-# Safe, guided Git TUI using whiptail.
-# Focus: common Git workflows + strong safeguards against destructive actions.
-#
-# v0.3.2 highlights:
-# - classic menu push now offers push options (current branch / all branches)
-# - squash-merge flow uses the same push helper as the menus
-
-# v0.3.1 highlights:
-# - improved upstream manager (view/set/pick/unset)
-#
-# v0.3.0 highlights:
-# - remembers repos + settings in ~/.config/gutt/
-# - refuses to run as root (v1 safety rule)
-# - staging/commit/amend, branches, merge/rebase, stash, remotes, logs/diffs
-# - hygiene assistant (.gitignore suggestions)
-# - danger zone: reflog, reset, clean (dry-run first), force push (force-with-lease), "no paper trail" baseline rewrite
+# GUTT - Git User TUI Tool (v0.3.5)
 
 set -Eeuo pipefail
 
-VERSION="v0.3.2"
+VERSION="v0.3.5"
 APP_NAME="GUTT"
 CFG_DIR="${HOME}/.config/gutt"
 CACHE_DIR="${HOME}/.cache/gutt"
@@ -36,6 +20,23 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
 }
 
+# Tempfile tracking (prevents orphaned /tmp files on exit/crash)
+__GUTT_TMPFILES=()
+mktemp_gutt() {
+  local t
+  t="$(mktemp "${TMPDIR:-/tmp}/gutt.XXXXXX")"
+  __GUTT_TMPFILES+=("$t")
+  printf '%s' "$t"
+}
+gutt_cleanup_tmpfiles() {
+  local f
+  for f in "${__GUTT_TMPFILES[@]:-}"; do
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+trap 'gutt_cleanup_tmpfiles' EXIT
+
+
 # Read key=value from config (bash-safe)
 cfg_get() {
   local key="$1" default="${2:-}"
@@ -50,8 +51,17 @@ cfg_set() {
   local key="$1" val="$2"
   mkdir -p "$CFG_DIR"
   touch "$CFG_FILE"
-  if grep -qE "^[[:space:]]*${key}=" "$CFG_FILE"; then
-    sed -i "s|^[[:space:]]*${key}=.*$|${key}=${val}|" "$CFG_FILE"
+
+  # Escape for safe sed use (replacement + key regex)
+  local key_re esc_val
+  key_re="$(printf '%s' "$key" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g')"
+  esc_val="$(printf '%s' "$val" | sed -e 's/[&|]/\\&/g')"
+
+  if grep -qE "^[[:space:]]*${key_re}=" "$CFG_FILE"; then
+    local tmp
+    tmp="$(mktemp_gutt)"
+    sed -e "s|^[[:space:]]*${key_re}=.*$|${key}=${esc_val}|" "$CFG_FILE" >"$tmp"
+    mv -f "$tmp" "$CFG_FILE"
   else
     printf '%s=%s\n' "$key" "$val" >> "$CFG_FILE"
   fi
@@ -87,22 +97,113 @@ EOF
 # -------------------------
 # UI helpers
 # -------------------------
-msgbox() { whiptail --title "$APP_NAME $VERSION" --msgbox "$1" 18 80 3>&1 1>&2 2>&3; }
+msgbox() {
+  # Display-only helper: never allow whiptail return codes to trip errexit.
+  local had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  whiptail --title "$APP_NAME $VERSION" --msgbox "$1" 18 80 </dev/tty >/dev/tty 2>/dev/tty
+  ((had_e)) && set -e
+  return 0
+}
 
 inputbox() {
   local prompt="$1" default="${2:-}"
+  local had_e=0 rc=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
   whiptail --title "$APP_NAME $VERSION" --inputbox "$prompt" 10 78 "$default" 3>&1 1>&2 2>&3
+  rc=$?
+  ((had_e)) && set -e
+  return $rc
 }
 
 menu() {
   local title="$1" text="$2"
   shift 2
+  local had_e=0 rc=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
   whiptail --title "$title" --menu "$text" 20 90 12 "$@" 3>&1 1>&2 2>&3
+  rc=$?
+  ((had_e)) && set -e
+  return $rc
+}
+# Run an action without letting non-zero returns trip errexit (set -e).
+# Captures the action exit status in GUTT_LAST_RC.
+GUTT_LAST_RC=0
+GUTT_REQUIRE_RESTART=0
+gutt_run_action() {
+  local had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  GUTT_REQUIRE_RESTART=0
+  "$@"
+  GUTT_LAST_RC=$?
+  ((had_e)) && set -e
+
+  # 0 = success
+  # 2 = user cancel / back (convention used by several menus)
+  if [[ $GUTT_LAST_RC -ne 0 && $GUTT_LAST_RC -ne 2 ]]; then
+    msgbox "⚠ Action failed (exit $GUTT_LAST_RC):
+
+$*"
+  fi
+
+  if [[ $GUTT_LAST_RC -eq 0 && ${GUTT_REQUIRE_RESTART:-0} -eq 1 ]]; then
+    msgbox "Restart Required
+
+PATH integration has been removed.
+Because shell PATH changes do not affect this current terminal session,
+GUTT will now exit.
+
+Please open a new terminal (or run: exec $SHELL) and then rerun GUTT."
+    exit 0
+  fi
+  return 0
 }
 
-yesno() { whiptail --title "$APP_NAME $VERSION" --yesno "$1" 12 78 3>&1 1>&2 2>&3; }
 
-textbox() { whiptail --title "$APP_NAME $VERSION" --textbox "$1" 22 90 3>&1 1>&2 2>&3; }
+yesno() {
+  local had_e=0 rc=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "$1" 12 78 3>&1 1>&2 2>&3
+  rc=$?
+  ((had_e)) && set -e
+  return $rc
+}
+
+textbox() {
+  # Usage:
+  #   textbox "/path/to/file"
+  #   textbox "Title here" "/path/to/file"
+  #
+  # Display-only helper: never allow whiptail return codes to trip errexit.
+  local title file had_e=0
+  [[ $- == *e* ]] && had_e=1
+
+  if [[ $# -eq 1 ]]; then
+    title="$APP_NAME $VERSION"
+    file="$1"
+  elif [[ $# -ge 2 ]]; then
+    title="$1"
+    file="$2"
+  else
+    msgbox "Internal error: textbox() called with no arguments."
+    return 0
+  fi
+
+  if [[ ! -r "$file" ]]; then
+    msgbox "Unable to open file for viewing:\n\n$file"
+    return 0
+  fi
+
+  set +e
+  whiptail --title "$title" --textbox "$file" 22 90 </dev/tty >/dev/tty 2>/dev/tty
+  ((had_e)) && set -e
+  return 0
+}
 
 # -------------------------
 # Git helpers (safe wrappers)
@@ -111,7 +212,7 @@ run_git_capture() {
   # Usage: run_git_capture <repo> <command...>
   local repo="$1"; shift
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && "$@") >"$tmp" 2>&1 || true
   textbox "$tmp"
   rm -f "$tmp"
@@ -199,7 +300,7 @@ vnext_create_feature_branch() {
   fi
 
   # Switch to main safely (prefer git switch, fall back to checkout for older Git).
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git switch "$main" >/dev/null 2>"$tmp") || (cd "$repo" && git checkout "$main" >/dev/null 2>"$tmp") || {
     textbox "$tmp"
     rm -f "$tmp"
@@ -222,7 +323,7 @@ vnext_create_feature_branch() {
     msgbox "Invalid branch name:\n\n$branch\n\nTry again."
   done
 
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && git switch -c "$branch" >/dev/null 2>"$tmp") || (cd "$repo" && git checkout -b "$branch" >/dev/null 2>"$tmp") || {
     textbox "$tmp"
     rm -f "$tmp"
@@ -230,7 +331,7 @@ vnext_create_feature_branch() {
   }
   rm -f "$tmp"
 
-  local sum; sum="$(mktemp)"
+  local sum; sum="$(mktemp_gutt)"
   repo_summary "$repo" > "$sum"
   textbox "$sum"
   rm -f "$sum"
@@ -239,7 +340,7 @@ vnext_create_feature_branch() {
 vnext_run_smoke_tests() {
   local repo="$1"
   local tmp rc=0
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
 
   {
     echo "GUTT vNext: Smoke tests"
@@ -318,7 +419,7 @@ vnext_run_smoke_tests() {
 }
 
 # -------------------------
-# vNext: Tags & Releases
+# vNext: Tags & Known-Good
 # -------------------------
 
 git_tag_exists() {
@@ -339,20 +440,59 @@ have_origin_remote() {
 
 vnext_list_tags() {
   local repo="$1"
-  local tmp
-  tmp="$(mktemp)"
+  local tmp tags_tmp head branch points
 
-  (cd "$repo" && git for-each-ref --sort=-creatordate \
-    --format='%(refname:short)\t%(objectname:short)\t%(creatordate:short)\t%(subject)' \
-    refs/tags) >"$tmp" 2>&1 || true
+  tmp="$(mktemp_gutt)"
+  tags_tmp="$(mktemp_gutt)"
 
-  if [[ ! -s "$tmp" ]]; then
-    echo "No tags found." >"$tmp"
+  # Header: show where we are and any tags that point at HEAD (useful "am I on known-good?" check)
+  head="$(cd "$repo" && git rev-parse --short HEAD 2>/dev/null || echo "?")"
+  branch="$(cd "$repo" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+  points="$(cd "$repo" && git tag --points-at HEAD 2>/dev/null | sort | tr '
+' ' ' | sed 's/[[:space:]]*$//')"
+
+  {
+    echo "Repo:   $repo"
+    echo "Branch: $branch"
+    echo "HEAD:   $head"
+    if [[ -n "$points" ]]; then
+      echo "Tags @ HEAD: $points"
+    else
+      echo "Tags @ HEAD: (none)"
+    fi
+    echo
+    echo "Legend: A=annotated tag, L=lightweight tag"
+    echo
+    printf "%-2s  %-32s  %-10s  %-10s  %s
+" "T" "TAG" "COMMIT" "DATE" "SUBJECT"
+    printf "%-2s  %-32s  %-10s  %-10s  %s
+" "--" "--------------------------------" "--------" "----------" "------------------------------"
+  } >"$tmp"
+
+  # Tag list (read-only). We classify annotated vs lightweight by objecttype:
+  # - annotated: objecttype=tag
+  # - lightweight: objecttype=commit (or other)
+  (cd "$repo" && git for-each-ref --sort=-creatordate     --format='%(objecttype)	%(refname:short)	%(objectname:short)	%(creatordate:short)	%(subject)'     refs/tags) 2>/dev/null | awk -F'	' '
+      {
+        t = ($1 == "tag") ? "A" : "L"
+        tag=$2; c=$3; d=$4; s=$5
+        if (s == "") s="(no subject)"
+        printf "%-2s  %-32s  %-10s  %-10s  %s
+", t, tag, c, d, s
+      }
+    ' >"$tags_tmp" || true
+
+  if [[ ! -s "$tags_tmp" ]]; then
+    echo "No tags found." >>"$tmp"
+  else
+    cat "$tags_tmp" >>"$tmp"
   fi
 
   textbox "$tmp"
-  rm -f "$tmp"
+  rm -f "$tmp" "$tags_tmp"
 }
+
+
 
 vnext_create_annotated_tag() {
   local repo="$1"
@@ -370,7 +510,7 @@ vnext_create_annotated_tag() {
 
   msg="$(inputbox "Tag message (annotation):" "Release / checkpoint")" || return 0
 
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && git tag -a "$tag" -m "$msg") >"$tmp" 2>&1 || true
   if git_tag_exists "$repo" "$tag"; then
     echo -e "Created annotated tag:\n\n$tag\n" >"$tmp"
@@ -383,25 +523,49 @@ vnext_create_annotated_tag() {
 
 vnext_mark_known_good() {
   local repo="$1"
-  local ts default_tag tag msg tmp
+  local ts default_tag tag note msg tmp branch head
 
   ts="$(date +%Y%m%d-%H%M)"
   default_tag="gutt/known-good-$ts"
 
-  tag="$(inputbox "Mark current commit as known-good\n\nEnter tag name:" "$default_tag")" || return 0
+  branch="$(cd "$repo" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+  head="$(cd "$repo" && git rev-parse --short HEAD 2>/dev/null || echo "?")"
+
+  tag="$(inputbox "Mark current commit as known-good
+
+Enter tag name:" "$default_tag")" || return 0
   tag="${tag## }"; tag="${tag%% }"
 
   if ! validate_tag_name "$tag"; then
-    msgbox "Invalid tag name:\n\n$tag"
+    msgbox "Invalid tag name:
+
+$tag"
     return 0
   fi
 
-  msg="$(inputbox "Tag message (annotation):" "Known-good checkpoint")" || return 0
+  note="$(inputbox "Optional note for this known-good tag (leave blank for none):" "")" || return 0
+  note="${note## }"; note="${note%% }"
 
-  tmp="$(mktemp)"
+  msg="Known-good state marked by GUTT"$'
+'"Branch: $branch"$'
+'"Commit: $head"
+  if [[ -n "$note" ]]; then
+    msg="$msg"$'
+
+'"Note: $note"
+  fi
+
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && git tag -a "$tag" -m "$msg") >"$tmp" 2>&1 || true
   if git_tag_exists "$repo" "$tag"; then
-    echo -e "Created known-good tag:\n\n$tag\n" >"$tmp"
+    {
+      echo "Created known-good tag:"
+      echo
+      echo "  Tag   : $tag"
+      echo "  Branch: $branch"
+      echo "  Commit: $head"
+      echo
+    } >"$tmp"
     textbox "$tmp"
   else
     textbox "$tmp"
@@ -412,11 +576,15 @@ vnext_mark_known_good() {
 
   if have_origin_remote "$repo"; then
     if whiptail --title "$APP_NAME $VERSION" --yesno --defaultno \
-      "Push this tag to origin now?\n\nTag: $tag" 12 78 3>&1 1>&2 2>&3; then
+      "Push this tag to origin now?
+
+Tag: $tag" 12 78 3>&1 1>&2 2>&3; then
       run_git_capture "$repo" git push origin "$tag"
     fi
   else
-    msgbox "No origin remote found.\n\nTag was created locally only."
+    msgbox "No origin remote found.
+
+Tag was created locally only."
   fi
 }
 
@@ -449,7 +617,7 @@ vnext_delete_local_tag() {
     return 0
   fi
 
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && git tag -d "$tag") >"$tmp" 2>&1 || true
   textbox "$tmp"
   rm -f "$tmp"
@@ -556,14 +724,75 @@ EOF
 
 danger_preflight() {
   local repo="$1" action="$2"
-  local tmp
-  tmp="$(mktemp)"
-  repo_summary "$repo" > "$tmp"
-  whiptail --title "$APP_NAME $VERSION" --yesno "DANGER: $action\n\n$(cat "$tmp")\n\nProceed?" 22 90 3>&1 1>&2 2>&3
-  local rc=$?
+  local tmp rc=0 had_e=0
+
+  tmp="$(mktemp_gutt)"
+  repo_summary "$repo" >"$tmp"
+
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "DANGER: $action
+
+$(cat "$tmp")
+
+Proceed?" 22 90 3>&1 1>&2 2>&3
+  rc=$?
+  ((had_e)) && set -e
+
   rm -f "$tmp"
+
+  # Phase 8.4: if we're about to do something risky, gently offer a known-good tag first.
+  # Default behaviour stays the same (this prompt defaults to NO and can be skipped).
+  if [[ $rc -eq 0 ]]; then
+    offer_known_good_tag "$repo"
+  fi
+
   return $rc
 }
+
+
+
+has_known_good_tag_at_head() {
+  local repo="$1"
+  (cd "$repo" && git tag --points-at HEAD "gutt/known-good-*" 2>/dev/null | head -n1 | grep -q .)
+}
+
+offer_known_good_tag() {
+  local repo="$1"
+
+  # If a known-good tag already points at HEAD, nothing to do.
+  if has_known_good_tag_at_head "$repo"; then
+    return 0
+  fi
+
+  if ! yesno "No known-good tag points at current HEAD.\n\nCreate one now? (Recommended)\n\nThis stays local unless you push tags." ; then
+    return 0
+  fi
+
+  local ts default_tag tag note branch head msg
+  ts="$(date +%Y%m%d-%H%M)"
+  default_tag="gutt/known-good-$ts"
+
+  tag="$(inputbox "Known-good tag name" "$default_tag")" || return 0
+  [[ -n "$tag" ]] || return 0
+
+  note="$(inputbox "Optional note (can be blank)" "")" || return 0
+
+  branch="$(git_current_branch "$repo")"
+  head="$(cd "$repo" && git rev-parse --short HEAD 2>/dev/null)" || head="?"
+
+  msg="Known-good state marked by GUTT\nBranch: $branch\nCommit: $head"
+  if [[ -n "$note" ]]; then
+    msg="$msg\n\nNote: $note"
+  fi
+
+  if (cd "$repo" && git tag -a "$tag" -m "$msg" >/dev/null 2>&1); then
+    msgbox "Created known-good tag:\n\n$tag"
+  else
+    msgbox "Failed to create known-good tag:\n\n$tag\n\n(If the tag already exists, choose a different name.)"
+  fi
+}
+
 
 offer_backup_tag() {
   local repo="$1"
@@ -593,17 +822,27 @@ refuse_if_dirty() {
 # -------------------------
 preflight() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    whiptail --title "$APP_NAME $VERSION" --msgbox \
-"GUTT should not be run as root.
+    local su_hint=""
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      su_hint="\n\nHint: this looks like sudo was used (SUDO_USER=${SUDO_USER})."
+    fi
 
-Running Git as root can:
+    msgbox "Detected EUID=0: you are running as root (usually because you used sudo).${su_hint}
+
+Do NOT run GUTT with sudo. It can:
  - create root-owned files in your repo
  - break your normal Git workflow
  - cause permission issues later
 
-Please re-run GUTT as a normal user.
+Run it as your normal user instead:
+  ./gutt.sh
 
-Exiting." 16 72 3>&1 1>&2 2>&3
+If you installed GUTT into PATH, just run:
+  gutt
+
+(Install-to-PATH is per-user, so install without sudo.)
+
+Exiting." || true
     exit 1
   fi
 
@@ -725,7 +964,7 @@ select_repo() {
 show_dashboard() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   repo_summary "$repo" > "$tmp"
   textbox "$tmp"
   rm -f "$tmp"
@@ -783,7 +1022,7 @@ action_full_status() {
   fi
 
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   {
     echo "=== GUTT: Full Status ==="
     echo
@@ -886,7 +1125,7 @@ Add a remote first (Remotes menu)."
     return 1
   fi
 
-  tmpf="$(mktemp)"
+  tmpf="$(mktemp_gutt)"
   (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
   rc=$?
   textbox "$tmpf"
@@ -902,7 +1141,7 @@ Add a remote first (Remotes menu)."
 
 action_pull_safe_update() {
   local repo="$1"
-  local branch upstream tmpf rc
+  local branch upstream tmpf rc ab ahead behind
 
   branch="$(git_current_branch "$repo")"
   if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
@@ -930,8 +1169,33 @@ or use 'Set / view upstream' in the Sync/Branch menus."
     return 1
   fi
 
+  # Preflight (may be stale until we fetch, but still useful context).
+  ab="$(cd "$repo" && git rev-list --left-right --count "HEAD...@{u}" 2>/dev/null || true)"
+  ahead="${ab%% *}"; behind="${ab##* }"
+  [[ -z "$ahead" || "$ahead" == "$ab" ]] && ahead="0"
+  [[ -z "$behind" ]] && behind="0"
+
+  if ! whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Pull (safe mode)?
+
+Branch:   $branch
+Upstream: $upstream
+
+What will happen:
+1) Update remote tracking refs:
+   git fetch --all --prune
+2) Fast-forward only update (no merges/rebases):
+   git merge --ff-only $upstream
+
+Current (may be stale until fetch):
+Ahead:   $ahead
+Behind:  $behind
+
+Proceed?" 20 72; then
+    return 0
+  fi
+
   # Step 1: fetch first (explicit, safe update).
-  tmpf="$(mktemp)"
+  tmpf="$(mktemp_gutt)"
   (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
   rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -942,8 +1206,38 @@ or use 'Set / view upstream' in the Sync/Branch menus."
   fi
   rm -f "$tmpf"
 
+  # Re-check after fetch for accurate ahead/behind and divergence.
+  ab="$(cd "$repo" && git rev-list --left-right --count "HEAD...@{u}" 2>/dev/null || true)"
+  ahead="${ab%% *}"; behind="${ab##* }"
+  [[ -z "$ahead" || "$ahead" == "$ab" ]] && ahead="0"
+  [[ -z "$behind" ]] && behind="0"
+
+  if [[ "$behind" == "0" ]]; then
+    if [[ "$ahead" != "0" ]]; then
+      msgbox "No pull needed.
+
+You are ahead of upstream by $ahead commit(s)."
+    else
+      msgbox "Already up to date (no commits to pull)."
+    fi
+    return 0
+  fi
+
+  if [[ "$ahead" != "0" ]]; then
+    msgbox "Pull aborted.
+
+Your branch appears to have diverged from upstream.
+
+Ahead:  $ahead
+Behind: $behind
+
+A merge or rebase would be required, and GUTT will not do that
+automatically in Fast Lane."
+    return 1
+  fi
+
   # Step 2: fast-forward only merge from upstream.
-  tmpf="$(mktemp)"
+  tmpf="$(mktemp_gutt)"
   (cd "$repo" && git merge --ff-only "$upstream") >"$tmpf" 2>&1
   rc=$?
   textbox "$tmpf"
@@ -963,6 +1257,7 @@ GUTT will not do that automatically in Fast Lane."
   fi
   return $rc
 }
+
 
 
 action_push() {
@@ -1032,7 +1327,7 @@ This will run:
   # Optional fetch first (safer push feedback).
   if [[ "$(cfg_get auto_fetch_before_push 1)" == "1" ]]; then
     local tmpf rc
-    tmpf="$(mktemp)"
+    tmpf="$(mktemp_gutt)"
     (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1045,7 +1340,7 @@ This will run:
   fi
 
   local tmpp rc
-  tmpp="$(mktemp)"
+  tmpp="$(mktemp_gutt)"
   (cd "$repo" && "${cmd[@]}") >"$tmpp" 2>&1
   rc=$?
   textbox "$tmpp"
@@ -1143,7 +1438,7 @@ vnext_push_current_branch() {
   # Optional fetch first (safer push feedback).
   if [[ "$(cfg_get auto_fetch_before_push 1)" == "1" ]]; then
     local tmpf rc
-    tmpf="$(mktemp)"
+    tmpf="$(mktemp_gutt)"
     (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1156,7 +1451,7 @@ vnext_push_current_branch() {
   fi
 
   local tmpp rc
-  tmpp="$(mktemp)"
+  tmpp="$(mktemp_gutt)"
   (cd "$repo" && "${cmd[@]}") >"$tmpp" 2>&1
   rc=$?
   textbox "$tmpp"
@@ -1194,7 +1489,7 @@ vnext_push_all_branches() {
   # Optional fetch first (consistency / feedback).
   if [[ "$(cfg_get auto_fetch_before_push 1)" == "1" ]]; then
     local tmpf rc
-    tmpf="$(mktemp)"
+    tmpf="$(mktemp_gutt)"
     (cd "$repo" && git fetch --all --prune) >"$tmpf" 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1207,7 +1502,7 @@ vnext_push_all_branches() {
   fi
 
   local tmpp rc
-  tmpp="$(mktemp)"
+  tmpp="$(mktemp_gutt)"
   (cd "$repo" && git push "$remote" --all) >"$tmpp" 2>&1
   rc=$?
   textbox "$tmpp"
@@ -1251,7 +1546,7 @@ Current upstream: ${upstream:-"(none)"}" \
 
     case "$choice" in
       VIEW)
-        local tmp; tmp="$(mktemp)"
+        local tmp; tmp="$(mktemp_gutt)"
         {
           echo "Branch:   $branch"
           echo "Upstream: ${upstream:-"(none)"}"
@@ -1308,7 +1603,7 @@ Proceed?" 16 78 3>&1 1>&2 2>&3; then
           remote="${rems[0]:-$remote}"
         fi
 
-        local tmpb; tmpb="$(mktemp)"
+        local tmpb; tmpb="$(mktemp_gutt)"
         (cd "$repo" && git for-each-ref "refs/remotes/${remote}/" --format='%(refname:short)') >"$tmpb" 2>/dev/null || true
         if [[ ! -s "$tmpb" ]]; then
           rm -f "$tmpb"
@@ -1382,7 +1677,7 @@ Proceed?" 16 78 3>&1 1>&2 2>&3; then
 # -------------------------
 action_stage_by_file() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git status --porcelain) >"$tmp" 2>/dev/null || true
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -1400,14 +1695,16 @@ action_stage_by_file() {
   rm -f "$tmp"
 
   local selected
-  selected="$(whiptail --title "$APP_NAME $VERSION" --checklist "Select files to stage" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)" || return 0
-  # shellcheck disable=SC2086
-  (cd "$repo" && eval "git add $selected") || true
+  selected="$(whiptail --title "$APP_NAME $VERSION" --separate-output --checklist "Select files to stage" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)" || return 0
+  [[ -n "${selected//$'\n'/}" ]] || return 0
+  local -a paths=()
+  mapfile -t paths <<<"$selected"
+  (cd "$repo" && git add -- "${paths[@]}") || true
 }
 
 action_unstage_by_file() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git diff --cached --name-only) >"$tmp" 2>/dev/null || true
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -1421,15 +1718,22 @@ action_unstage_by_file() {
   done <"$tmp"
   rm -f "$tmp"
 
-  local selected
-  selected="$(whiptail --title "$APP_NAME $VERSION" --checklist "Select files to unstage" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)" || return 0
-  # shellcheck disable=SC2086
-  (cd "$repo" && eval "git restore --staged $selected") || true
+  local selected rc=0 had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  selected="$(whiptail --title "$APP_NAME $VERSION" --separate-output --checklist "Select files to unstage" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)"
+  rc=$?
+  ((had_e)) && set -e
+  [[ $rc -eq 0 ]] || return 0
+  [[ -n "${selected//$'\n'/}" ]] || return 0
+  local -a paths=()
+  mapfile -t paths <<<"$selected"
+  (cd "$repo" && git restore --staged -- "${paths[@]}") || true
 }
 
 action_discard_file() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git status --porcelain) >"$tmp" 2>/dev/null || true
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -1444,8 +1748,13 @@ action_discard_file() {
   done <"$tmp"
   rm -f "$tmp"
 
-  local pick
-  pick="$(whiptail --title "$APP_NAME $VERSION" --menu "Select a file to discard changes (restore from HEAD). DANGER." 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)" || return 0
+  local pick rc=0 had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  pick="$(whiptail --title "$APP_NAME $VERSION" --menu "Select a file to discard changes (restore from HEAD). DANGER." 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)"
+  rc=$?
+  ((had_e)) && set -e
+  [[ $rc -eq 0 ]] || return 0
 
   if danger_preflight "$repo" "Discard changes to: $pick"; then
     offer_backup_tag "$repo"
@@ -1486,7 +1795,7 @@ action_commit() {
 
   # Guided view: show status + staged summary before asking for the message.
   local tmp br
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   br="$(git_current_branch "$repo")"
 
   (
@@ -1526,7 +1835,7 @@ action_commit() {
     case "$choice" in
       VIEW)
         local tmpd lines
-        tmpd="$(mktemp)"
+        tmpd="$(mktemp_gutt)"
         (cd "$repo" && git diff --cached 2>/dev/null) >"$tmpd" 2>/dev/null || true
         lines="$(wc -l <"$tmpd" 2>/dev/null || echo 0)"
         if [[ "$lines" -gt 2000 ]]; then
@@ -1576,7 +1885,7 @@ action_commit_preview() {
   fi
 
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (
     cd "$repo" 2>/dev/null || exit 0
     echo "Commit preview (no changes made)"
@@ -1642,7 +1951,7 @@ action_commit_preview() {
     case "$choice" in
       SDF)
         local tmpd lines
-        tmpd="$(mktemp)"
+        tmpd="$(mktemp_gutt)"
         (cd "$repo" && git diff --cached 2>/dev/null) >"$tmpd" 2>/dev/null || true
         lines="$(wc -l <"$tmpd" 2>/dev/null || echo 0)"
         if [[ "$lines" -gt 2000 ]]; then
@@ -1656,7 +1965,7 @@ action_commit_preview() {
         ;;
       UDF)
         local tmpu lines
-        tmpu="$(mktemp)"
+        tmpu="$(mktemp_gutt)"
         (cd "$repo" && git diff 2>/dev/null) >"$tmpu" 2>/dev/null || true
         lines="$(wc -l <"$tmpu" 2>/dev/null || echo 0)"
         if [[ "$lines" -gt 2000 ]]; then
@@ -1690,7 +1999,7 @@ action_commit_all() {
   local LINES_THRESHOLD=2000
 
   local tmp br
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   br="$(git_current_branch "$repo")"
 
   local count total_lines
@@ -1783,7 +2092,7 @@ action_checkpoint_commit() {
   local COUNT_THRESHOLD=25
   local LINES_THRESHOLD=2000
   local count total_lines tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   # Count tracked changed entries in working tree + index.
   (cd "$repo" && git status --porcelain) >"$tmp" 2>/dev/null || true
   count="$(grep -c '^[ MADRCU?!]' "$tmp" 2>/dev/null || true)"
@@ -1895,7 +2204,7 @@ Use: Amend last commit"
   # Context: show the last commit and its full message.
   run_git_capture "$repo" git log -1 --oneline --decorate
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && git log -1 --pretty=format:%B) >"$tmp" 2>&1 || true
   textbox "$tmp"
   rm -f "$tmp"
@@ -2035,7 +2344,7 @@ action_commit_menu() {
 # -------------------------
 stash_pick() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git stash list) >"$tmp" 2>/dev/null || true
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -2050,7 +2359,7 @@ stash_pick() {
     items+=("$key" "$line")
   done <"$tmp"
   rm -f "$tmp"
-  whiptail --title "$APP_NAME $VERSION" --menu "Select a stash" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3
+  whiptail --title "$APP_NAME $VERSION" --menu "Select a stash" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3 || return 1
 }
 
 action_stash_push() {
@@ -2081,7 +2390,7 @@ action_stash_push_quick() {
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
   msg="gutt quick stash $ts"
 
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (cd "$repo" && git stash push -m "$msg") >"$tmp" 2>&1
   rc=$?
   textbox "$tmp"
@@ -2148,7 +2457,7 @@ action_stash_menu() {
 # -------------------------
 pick_branch() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git branch --format='%(refname:short)') >"$tmp" 2>/dev/null || true
   [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
   local items=()
@@ -2157,7 +2466,7 @@ pick_branch() {
     items+=("$b" "")
   done <"$tmp"
   rm -f "$tmp"
-  whiptail --title "$APP_NAME $VERSION" --menu "Select a branch" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3
+  whiptail --title "$APP_NAME $VERSION" --menu "Select a branch" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3 || return 1
 }
 
 action_branch_create() {
@@ -2185,7 +2494,7 @@ Switching branches may carry changes across.
 If unsure, stash or commit first."
   fi
 
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git branch --format='%(refname:short)') >"$tmp" 2>/dev/null || true
   [[ -s "$tmp" ]] || { rm -f "$tmp"; msgbox "No local branches found."; return 1; }
 
@@ -2199,10 +2508,15 @@ If unsure, stash or commit first."
   done <"$tmp"
   rm -f "$tmp"
 
-  local choice
+  local choice rc=0 had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
   choice="$(whiptail --title "$APP_NAME $VERSION" --menu "Select a branch
 
-Current: $cur" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)" || return 0
+Current: $cur" 22 90 12 "${items[@]}" 3>&1 1>&2 2>&3)"
+  rc=$?
+  ((had_e)) && set -e
+  [[ $rc -eq 0 ]] || return 0
   [[ -n "$choice" ]] || return 0
 
   if [[ "$choice" == "$cur" ]]; then
@@ -2323,7 +2637,7 @@ action_merge_menu() {
 # -------------------------
 pick_remote() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git remote) >"$tmp" 2>/dev/null || true
   [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
   local items=()
@@ -2332,7 +2646,7 @@ pick_remote() {
     items+=("$r" "")
   done <"$tmp"
   rm -f "$tmp"
-  whiptail --title "$APP_NAME $VERSION" --menu "Select a remote" 18 70 10 "${items[@]}" 3>&1 1>&2 2>&3
+  whiptail --title "$APP_NAME $VERSION" --menu "Select a remote" 18 70 10 "${items[@]}" 3>&1 1>&2 2>&3 || return 1
 }
 
 action_remote_add() {
@@ -2442,7 +2756,7 @@ gitignore_suggest() {
     return 0
   fi
 
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   cat >"$tmp" <<EOF
 Suggested .gitignore entries:
 
@@ -2464,7 +2778,7 @@ EOF
 
 hygiene_scan() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   local dirty_count staged_count untracked_count det_head upstream
   dirty_count="$(cd "$repo" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
   staged_count="$(cd "$repo" && git diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')"
@@ -2552,7 +2866,7 @@ action_reset_menu() {
 
 action_clean_untracked() {
   local repo="$1"
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git clean -nd) >"$tmp" 2>&1 || true
   textbox "$tmp"
   rm -f "$tmp"
@@ -2565,29 +2879,41 @@ action_clean_untracked() {
 
 action_force_push() {
   local repo="$1"
+
   git_is_detached "$repo" && { msgbox "Detached HEAD."; return 1; }
   refuse_if_dirty "$repo" "force push" || return 1
 
-  local mode phrase u remote
-  mode="$(cfg_get force_push_mode force-with-lease)"
-  case "$mode" in
-    force-with-lease|force) ;;
-    *) mode="force-with-lease" ;;
-  esac
-
+  # Phase 11.3: only allow --force-with-lease (no plain --force)
+  local mode phrase u remote branchref
+  mode="force-with-lease"
   phrase="$(cfg_get confirm_phrase_forcepush OVERWRITE REMOTE)"
+
   u="$(git_upstream "$repo")"
   [[ -n "$u" ]] || { msgbox "No upstream set.
 
 Set upstream first."; return 1; }
 
   remote="${u%%/*}"
+  branchref="${u#*/}"
   [[ -n "$remote" ]] || remote="origin"
+
+  # Default NO confirmation (do not rely on the global yesno wrapper here)
+  if ! whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Force push (with lease) is guarded.
+
+This can overwrite remote history.
+
+Upstream:
+$u
+
+Proceed to view the preflight summary?" 14 78 3>&1 1>&2 2>&3
+  then
+    return 0
+  fi
 
   # Refresh remote tracking info so the summary is meaningful
   ( cd "$repo" && git fetch "$remote" --prune >/dev/null 2>&1 ) || true
 
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   {
     echo "About to FORCE PUSH (mode: --$mode)"
     echo
@@ -2603,9 +2929,12 @@ Set upstream first."; return 1; }
     echo "This can overwrite remote history."
     echo
     echo "Command:"
-    echo "  git push --$mode"
+    echo "  git push --$mode $remote HEAD:$branchref"
+    echo
+    echo "Safety tag:"
+    echo "  A local safety tag will be created automatically before the push."
   } >"$tmp"
-  textbox "$tmp"
+  textbox "$tmp" || true
   rm -f "$tmp"
 
   confirm_phrase "Final confirmation required.
@@ -2613,10 +2942,30 @@ Set upstream first."; return 1; }
 This can overwrite remote history.
 
 Type the phrase to continue:" "$phrase" || { msgbox "Cancelled."; return 0; }
-  danger_preflight "$repo" "Force push to $u" || return 0
-  offer_backup_tag "$repo"
-  run_git_capture "$repo" git push --"$mode"
+  danger_preflight "$repo" "Force push (with lease) to $u" || return 0
+
+  # Mandatory safety tag creation
+  local ts tag
+  ts="$(date +%Y%m%d-%H%M%S)"
+  tag="gutt/safety-before-forcepush-$ts"
+  if ! (cd "$repo" && git tag -f "$tag" >/dev/null 2>&1); then
+    msgbox "Refusing to continue.
+
+Failed to create safety tag:
+
+$tag"
+    return 1
+  fi
+
+  msgbox "Safety tag created:
+
+$tag
+
+Proceeding with push (with lease)."
+
+  run_git_capture "$repo" git push --"$mode" "$remote" "HEAD:$branchref"
 }
+
 
 action_no_paper_trail() {
   local repo="$1"
@@ -2636,7 +2985,7 @@ action_no_paper_trail() {
   phrase="$(cfg_get confirm_phrase_forcepush OVERWRITE REMOTE)"
   confirm_phrase "This rewrites local history.\n\nIf the remote already has commits, you may need a force push afterwards.\n\nType the phrase to continue:" "$phrase" || { msgbox "Cancelled."; return 0; }
 
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (
     set -e
     cd "$repo"
@@ -2665,11 +3014,11 @@ action_danger_menu() {
       "NOP" "Rewrite history baseline ('no paper trail')" \
       "BACK" "Back")" || return 0
     case "$choice" in
-      RFL) run_git_capture "$repo" git reflog -n 30 ;;
-      RST) action_reset_menu "$repo" ;;
-      CLN) action_clean_untracked "$repo" ;;
-      FRC) action_force_push "$repo" ;;
-      NOP) action_no_paper_trail "$repo" ;;
+      RFL) gutt_run_action run_git_capture "$repo" git reflog -n 30 ;;
+      RST) gutt_run_action action_reset_menu "$repo" ;;
+      CLN) gutt_run_action action_clean_untracked "$repo" ;;
+      FRC) gutt_run_action action_force_push "$repo" ;;
+      NOP) gutt_run_action action_no_paper_trail "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -2678,6 +3027,1227 @@ action_danger_menu() {
 # -------------------------
 # Settings
 # -------------------------
+
+# -------------------------
+# PATH shortcut helper (SAFE / ADDITIVE) - DaST-style
+#
+# Goals:
+# - Install a 'gutt' shortcut without breaking script self-discovery.
+# - Never overwrite "foreign" gutt commands in unexpected locations.
+# - Default NO on confirmations.
+# - Cancel/Esc safe under set -Eeuo pipefail (wrappers already guarded).
+# - Removable from safe locations only.
+# -------------------------
+
+gutt_self_realpath() {
+  readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s
+' "${BASH_SOURCE[0]}"
+}
+
+gutt_shortcut_status() {
+  # Outputs: found(0/1) path realpath is_ours(0/1)
+  # "found" means either:
+  #   - a gutt command resolves in this shell (command -v), OR
+  #   - a managed wrapper exists in common install locations (even if not on PATH in this shell)
+  local p="" rp="" ours="0"
+
+  local cv="" tt=""
+  cv="$(command -v gutt 2>/dev/null || true)"
+  tt="$(type -t gutt 2>/dev/null || true)"
+
+  if [[ -n "$cv" ]]; then
+    # If gutt is an alias/function/builtin, we still report "found",
+    # but we can't safely treat it as a wrapper file.
+    if [[ "$tt" != "file" && "$tt" != "keyword" ]]; then
+      printf '1 %s "" 0
+' "$cv"
+      return 0
+    fi
+    p="$cv"
+  fi
+
+  # If not found on PATH (or not a file), look for common wrapper locations directly.
+  if [[ -z "$p" || ! -x "$p" ]]; then
+    local cand
+    for cand in "$HOME/.local/bin/gutt" "$HOME/bin/gutt" "/usr/local/bin/gutt"; do
+      if [[ -x "$cand" ]]; then
+        p="$cand"
+        break
+      fi
+    done
+  fi
+
+  if [[ -n "$p" && -f "$p" ]]; then
+    rp="$(readlink -f "$p" 2>/dev/null || true)"
+
+    # If /usr/local/bin/gutt (or ~/.local/bin/gutt) is a wrapper (not symlink), extract target.
+    if [[ -f "$p" && ! -L "$p" ]]; then
+      # Marker makes "ours" detection robust even if entry target has moved.
+      if grep -qE '^[[:space:]]*# GUTT_WRAPPER[[:space:]]*$' "$p" 2>/dev/null; then
+        ours="1"
+      fi
+
+      # Legacy wrapper support (pre-marker installs)
+      # If the wrapper lives in a safe user location and contains GUTT_ENTRY (or references gutt.sh),
+      # treat it as ours so we can update it cleanly.
+      if [[ "$ours" != "1" ]]; then
+        case "$p" in
+          "$HOME/.local/bin/gutt" | "$HOME/bin/gutt")
+            if grep -qE '^[[:space:]]*GUTT_ENTRY=' "$p" 2>/dev/null; then
+              ours="1"
+            elif grep -qF "gutt.sh" "$p" 2>/dev/null; then
+              ours="1"
+            fi
+            ;;
+        esac
+      fi
+
+      local _t=""
+      _t="$(grep -E '^[[:space:]]*GUTT_ENTRY=' "$p" 2>/dev/null | head -n 1 | sed -E 's/^[[:space:]]*GUTT_ENTRY=//')"
+      _t="${_t%\"}"; _t="${_t#\"}"
+      _t="${_t%\'}"; _t="${_t#\'}"
+      if [[ -n "$_t" ]]; then
+        rp="$(readlink -f -- "$_t" 2>/dev/null || printf '%s' "$_t")"
+      fi
+    fi
+  fi
+
+  local self=""
+  self="$(gutt_self_realpath 2>/dev/null || true)"
+  if [[ "$ours" != "1" && -n "$rp" && -n "$self" && "$rp" == "$self" ]]; then
+    ours="1"
+  fi
+
+  if [[ -n "$p" ]]; then
+    printf '1 %s %s %s
+' "$p" "$rp" "$ours"
+  else
+    printf '0 "" "" 0
+'
+  fi
+}
+
+# PATH integration richer state (no UI wiring yet)
+# States:
+# - INSTALLED   : gutt resolves on PATH and is managed by GUTT
+# - PARTIAL     : wrapper exists but its directory is not on PATH
+# - FOREIGN     : gutt resolves on PATH but is not managed by GUTT
+# - UNINSTALLED : no wrapper and no gutt on PATH
+gutt_path_integration_state() {
+  # PATH-authoritative semantic state for the *current shell*.
+  #
+  # States:
+  # - INSTALLED   : gutt resolves on PATH and is managed by this GUTT
+  # - FOREIGN     : gutt resolves on PATH but is not managed by this GUTT
+  # - PARTIAL     : a wrapper exists in a common install location, but PATH cannot resolve gutt
+  # - UNINSTALLED : no wrapper and no gutt on PATH
+  local cv="" tt="" p="" ours="0"
+
+  cv="$(command -v gutt 2>/dev/null || true)"
+  tt="$(type -t gutt 2>/dev/null || true)"
+
+  if [[ -n "$cv" ]]; then
+    # If gutt is an alias/function/builtin, it's callable but not a wrapper we can own/manage.
+    if [[ "$tt" != "file" && "$tt" != "keyword" ]]; then
+      echo "FOREIGN"
+      return 0
+    fi
+
+    p="$cv"
+
+    # Determine whether this PATH-resolved gutt is ours.
+    if [[ -n "$p" && -f "$p" ]]; then
+      # Marker makes "ours" detection robust even if entry target has moved.
+      if grep -qE '^[[:space:]]*# GUTT_WRAPPER[[:space:]]*$' "$p" 2>/dev/null; then
+        ours="1"
+      else
+        # Legacy wrapper support (pre-marker installs)
+        case "$p" in
+          "$HOME/.local/bin/gutt" | "$HOME/bin/gutt")
+            if grep -qE '^[[:space:]]*GUTT_ENTRY=' "$p" 2>/dev/null; then
+              ours="1"
+            elif grep -qF "gutt.sh" "$p" 2>/dev/null; then
+              ours="1"
+            fi
+            ;;
+        esac
+      fi
+
+      # If wrapper exposes a target, also compare it to our current entry path.
+      if [[ "$ours" != "1" ]]; then
+        local _t="" rp="" self=""
+        _t="$(grep -E '^[[:space:]]*GUTT_ENTRY=' "$p" 2>/dev/null | head -n 1 | sed -E 's/^[[:space:]]*GUTT_ENTRY=//')"
+        _t="${_t%\"}"; _t="${_t#\"}"
+        _t="${_t%\'}"; _t="${_t#\'}"
+        if [[ -n "$_t" ]]; then
+          rp="$(readlink -f -- "$_t" 2>/dev/null || printf '%s' "$_t")"
+          self="$(gutt_self_realpath 2>/dev/null || true)"
+          if [[ -n "$rp" && -n "$self" && "$rp" == "$self" ]]; then
+            ours="1"
+          fi
+        fi
+      fi
+    fi
+
+    if [[ "$ours" == "1" ]]; then
+      echo "INSTALLED"
+    else
+      echo "FOREIGN"
+    fi
+    return 0
+  fi
+
+  # Not callable via PATH in this shell. Look for a disk-only wrapper (partial install).
+  if [[ -x "$HOME/.local/bin/gutt" || -x "$HOME/bin/gutt" ]]; then
+    echo "PARTIAL"
+  else
+    echo "UNINSTALLED"
+  fi
+}
+
+
+gutt_path_integration_label() {
+  local st="${1:-}"
+  if [[ -z "$st" ]]; then
+    st="$(gutt_path_integration_state)"
+  fi
+  case "$st" in
+    INSTALLED) gutt_run_action echo "PATH Integration: INSTALLED (this GUTT)" ;;
+    PARTIAL) gutt_run_action echo "PATH Integration: PARTIAL (wrapper present, not on PATH)" ;;
+    FOREIGN) gutt_run_action echo "PATH Integration: FOREIGN (another gutt on PATH)" ;;
+    UNINSTALLED) gutt_run_action echo "PATH Integration: UNINSTALLED" ;;
+    *)           echo "PATH Integration: UNINSTALLED" ;;
+  esac
+}
+
+
+
+gutt_detect_user_shell() {
+  # Best-effort shell detection for selecting a user rc file.
+  # Prefer $SHELL, fall back to parent process.
+  local sh=""
+  sh="${SHELL##*/}"
+  sh="${sh,,}"
+
+  if [[ -z "$sh" ]]; then
+    sh="$(ps -p "${PPID:-0}" -o comm= 2>/dev/null | head -n 1 | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
+  fi
+
+  case "$sh" in
+    zsh|bash) echo "$sh" ;;
+    *) echo "bash" ;;
+  esac
+}
+
+gutt_path_rc_file_for_shell() {
+  # Echo the preferred rc file for the detected shell.
+  local sh
+  sh="$(gutt_detect_user_shell)"
+  case "$sh" in
+    zsh)
+      printf '%s\n' "$HOME/.zshrc"
+      ;;
+    bash|*)
+      if [[ -f "$HOME/.bashrc" ]]; then
+        printf '%s\n' "$HOME/.bashrc"
+      else
+        printf '%s\n' "$HOME/.profile"
+      fi
+      ;;
+  esac
+}
+
+gutt_path_managed_block_present() {
+  local rcfile="$1"
+  [[ -n "$rcfile" ]] || return 1
+  grep -Fq "# >>> GUTT PATH >>>" "$rcfile" 2>/dev/null && return 0
+  grep -Fq "# <<< GUTT PATH <<<" "$rcfile" 2>/dev/null && return 0
+  return 1
+}
+
+
+gutt_path_managed_block_health() {
+  # Echo: OK | NONE | MULTIPLE | MALFORMED
+  local rcfile="$1"
+  [[ -n "$rcfile" ]] || { echo "NONE"; return 0; }
+
+  local start_count end_count
+  start_count="$(grep -Fxc "# >>> GUTT PATH >>>" "$rcfile" 2>/dev/null || echo 0)"
+  end_count="$(grep -Fxc "# <<< GUTT PATH <<<" "$rcfile" 2>/dev/null || echo 0)"
+
+  if [[ "${start_count:-0}" -eq 0 && "${end_count:-0}" -eq 0 ]]; then
+    echo "NONE"
+    return 0
+  fi
+
+  if [[ "${start_count:-0}" -eq 1 && "${end_count:-0}" -eq 1 ]]; then
+    local sline eline
+    sline="$(grep -Fn "# >>> GUTT PATH >>>" "$rcfile" 2>/dev/null | head -n 1 | cut -d: -f1)"
+    eline="$(grep -Fn "# <<< GUTT PATH <<<" "$rcfile" 2>/dev/null | head -n 1 | cut -d: -f1)"
+    if [[ -n "$sline" && -n "$eline" && "$sline" -lt "$eline" ]]; then
+      echo "OK"
+    else
+      echo "MALFORMED"
+    fi
+    return 0
+  fi
+
+  echo "MULTIPLE"
+  return 0
+}
+
+gutt_path_scan_unmanaged_lines() {
+  # Prints up to 40 matching lines outside the managed block:
+  # lines that reference .local/bin and PATH
+  local rcfile="$1"
+  [[ -n "$rcfile" ]] || return 0
+  awk '
+    BEGIN { in=0 }
+    /# >>> GUTT PATH >>>/ { in=1; next }
+    /# <<< GUTT PATH <<</ { in=0; next }
+    {
+      if (!in && $0 ~ /\.local\/bin/ && $0 ~ /PATH/) {
+        printf "%d:%s
+", NR, $0
+      }
+    }
+  ' "$rcfile" 2>/dev/null | head -n 40
+}
+
+gutt_path_show_scan_report() {
+  local sh rcfile health unmanaged
+  sh="$(gutt_detect_user_shell)"
+  rcfile="$(gutt_path_rc_file_for_shell)"
+  health="$(gutt_path_managed_block_health "$rcfile")"
+  unmanaged="$(gutt_path_scan_unmanaged_lines "$rcfile")"
+
+  local msg=""
+  msg+="Shell: $sh
+"
+  msg+="Config file: $rcfile
+
+"
+
+  case "$health" in
+    NONE)      msg+="Managed block: not present
+" ;;
+    OK)        msg+="Managed block: present (OK)
+" ;;
+    MULTIPLE)  msg+="Managed block: ⚠ multiple marker blocks detected
+" ;;
+    MALFORMED) msg+="Managed block: ⚠ malformed markers/order detected
+" ;;
+    *)         msg+="Managed block: unknown
+" ;;
+  esac
+
+  if [[ -n "$unmanaged" ]]; then
+    msg+="
+⚠ Legacy/unmanaged PATH edits referencing .local/bin found (outside managed block):
+"
+    msg+="$unmanaged
+"
+    msg+="
+Note: GUTT will not remove unknown PATH lines automatically.
+"
+  else
+    msg+="
+No legacy/unmanaged .local/bin PATH edits detected outside the managed block.
+"
+  fi
+
+  msgbox "$msg"
+  return 0
+}
+
+gutt_path_repair_managed_block() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    msgbox "Per-user install. Run GUTT as your normal user."
+    return 0
+  fi
+
+  # Repairs only the content between the first pair of our markers (if valid).
+  local sh rcfile health rc
+  sh="$(gutt_detect_user_shell)"
+  rcfile="$(gutt_path_rc_file_for_shell)"
+  health="$(gutt_path_managed_block_health "$rcfile")"
+
+  if [[ "$health" == "NONE" ]]; then
+    msgbox "No managed block to repair.
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  if [[ "$health" != "OK" ]]; then
+    msgbox "⚠ Managed block markers are not in a simple repairable state (health=$health).
+
+File:
+$rcfile
+
+GUTT will not attempt an automatic repair here. Use the scan report and fix manually if needed."
+    return 0
+  fi
+
+  if ! yesno "🛠 Repair managed PATH block
+
+Shell: $sh
+File: $rcfile
+
+This will ONLY replace the content between:
+  # >>> GUTT PATH >>>
+  # <<< GUTT PATH <<<
+
+with the canonical line:
+  export PATH=\"\$HOME/.local/bin:\$PATH\"
+
+Proceed?"; then
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp_gutt)"
+
+  set +e
+  awk '
+    BEGIN { in=0; done=0 }
+    /^# >>> GUTT PATH >>>[[:space:]]*$/ {
+      print
+      if (!done) {
+        print "export PATH=\"$HOME/.local/bin:$PATH\""
+        in=1
+      }
+      next
+    }
+    /^# <<< GUTT PATH <<<[[:space:]]*$/ {
+      if (in && !done) {
+        in=0
+        done=1
+        print
+        next
+      }
+      print
+      next
+    }
+    {
+      if (in && !done) next
+      print
+    }
+  ' "$rcfile" >"$tmp" 2>/dev/null
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to build repaired file (rc=$rc).
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  set +e
+  mv -f -- "$tmp" "$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to write repaired file (rc=$rc).
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  msgbox "✅ Repaired managed PATH block.
+
+File:
+$rcfile
+
+Open a new terminal (or source the file) and try:
+  command -v gutt
+  gutt"
+  return 0
+}
+
+
+gutt_path_purge_and_rebuild_managed_block() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    msgbox "Per-user install. Run GUTT as your normal user."
+    return 0
+  fi
+
+  local sh rcfile health rc
+  sh="$(gutt_detect_user_shell)"
+  rcfile="$(gutt_path_rc_file_for_shell)"
+  health="$(gutt_path_managed_block_health "$rcfile")"
+
+  if [[ "$health" == "NONE" ]]; then
+    msgbox "No managed PATH block markers were found.
+
+File:
+$rcfile
+
+Nothing to purge."
+    return 0
+  fi
+
+  if ! yesno "⚠ Recovery: purge and rebuild managed PATH block
+
+Shell: $sh
+File: $rcfile
+Health: $health
+
+This will:
+- Make a timestamped backup of the file
+- Remove ALL GUTT managed-block marker pairs (and their contents) if present
+- Remove orphan marker lines if present
+- Append a fresh clean managed block at the end
+
+Canonical line:
+  export PATH=\"\$HOME/.local/bin:\$PATH\"
+
+Proceed?"; then
+    return 0
+  fi
+
+  # Ensure file exists
+  set +e
+  mkdir -p -- "$(dirname -- "$rcfile")" 2>/dev/null
+  touch -- "$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    msgbox "❌ Failed to prepare config file (rc=$rc).
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  local ts backup tmp
+  ts="$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'backup')"
+  backup="${rcfile}.gutt.bak.${ts}"
+  tmp="$(mktemp_gutt)"
+
+  set +e
+  cp -p -- "$rcfile" "$backup" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to create backup (rc=$rc).
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  # Purge logic:
+  # - If we see a start marker, buffer until we see an end marker.
+  #   If we see a matching end marker, we drop the whole buffered block.
+  #   If we reach EOF without an end marker, we emit buffered lines except marker lines.
+  # - Orphan end markers are dropped.
+  set +e
+  awk '
+    function flush_buf(    i) {
+      for (i=1; i<=bn; i++) {
+        if (buf[i] != "# >>> GUTT PATH >>>" && buf[i] != "# <<< GUTT PATH <<<") {
+          print buf[i]
+        }
+      }
+      bn=0
+    }
+    BEGIN { in=0; bn=0 }
+    $0 == "# >>> GUTT PATH >>>" {
+      in=1
+      bn=0
+      buf[++bn]=$0
+      next
+    }
+    $0 == "# <<< GUTT PATH <<<" {
+      if (in==1) {
+        # matched end, drop buffered block and this end marker
+        in=0
+        bn=0
+        next
+      }
+      # orphan end marker, drop it
+      next
+    }
+    {
+      if (in==1) {
+        buf[++bn]=$0
+        next
+      }
+      # outside managed block, also drop any stray marker lines
+      if ($0 == "# >>> GUTT PATH >>>" || $0 == "# <<< GUTT PATH <<<") next
+      print
+    }
+    END {
+      if (in==1) {
+        # no end marker, keep buffered content but remove markers
+        flush_buf()
+      }
+    }
+  ' "$rcfile" >"$tmp" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to build purged file (rc=$rc).
+
+File:
+$rcfile
+
+Backup:
+$backup"
+    return 0
+  fi
+
+  set +e
+  {
+    printf '\n# >>> GUTT PATH >>>\n'
+    printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+    printf '# <<< GUTT PATH <<<\n'
+  } >>"$tmp" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to append fresh managed block (rc=$rc).
+
+File:
+$rcfile
+
+Backup:
+$backup"
+    return 0
+  fi
+
+  set +e
+  mv -f -- "$tmp" "$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to write updated file (rc=$rc).
+
+File:
+$rcfile
+
+Backup:
+$backup"
+    return 0
+  fi
+
+  msgbox "✅ Purged and rebuilt managed PATH block.
+
+File:
+$rcfile
+Backup:
+$backup
+
+Open a new terminal (or source the file) and try:
+  command -v gutt
+  gutt"
+  return 0
+}
+
+gutt_path_remove_managed_block() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    msgbox "Per-user install. Run GUTT as your normal user."
+    return 0
+  fi
+
+  local sh rcfile health rc
+  sh="$(gutt_detect_user_shell)"
+  rcfile="$(gutt_path_rc_file_for_shell)"
+  health="$(gutt_path_managed_block_health "$rcfile")"
+
+  if [[ "$health" == "NONE" ]]; then
+    msgbox "No managed PATH block markers were found.
+
+File:
+$rcfile
+
+Nothing to remove."
+    return 0
+  fi
+
+  if ! yesno "🧹 Remove managed PATH block
+
+Shell: $sh
+File: $rcfile
+Health: $health
+
+This will:
+- Make a timestamped backup of the file
+- Remove ALL marker pairs:
+    # >>> GUTT PATH >>>
+    # <<< GUTT PATH <<<
+  and anything between them
+- Remove orphan marker lines if present
+
+Note:
+- GUTT will NOT remove unknown PATH lines outside the managed block.
+- Removing the managed block may mean new terminals can no longer find:
+    gutt
+
+Proceed?"; then
+    return 0
+  fi
+
+  # Ensure file exists
+  set +e
+  mkdir -p -- "$(dirname -- "$rcfile")" 2>/dev/null
+  touch -- "$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    msgbox "❌ Failed to prepare config file (rc=$rc).
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  local ts backup tmp
+  ts="$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'backup')"
+  backup="${rcfile}.gutt.bak.${ts}"
+  tmp="$(mktemp_gutt)"
+
+  set +e
+  cp -p -- "$rcfile" "$backup" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to create backup (rc=$rc).
+
+File:
+$rcfile"
+    return 0
+  fi
+
+  # Purge logic:
+  # - Drop any complete managed blocks
+  # - Drop orphan marker lines
+  # - If a start marker is seen without an end marker, keep buffered lines but remove markers
+  set +e
+  awk '
+    function flush_buf(    i) {
+      for (i=1; i<=bn; i++) {
+        if (buf[i] != "# >>> GUTT PATH >>>" && buf[i] != "# <<< GUTT PATH <<<") {
+          print buf[i]
+        }
+      }
+      bn=0
+    }
+    BEGIN { in=0; bn=0 }
+    $0 == "# >>> GUTT PATH >>>" {
+      in=1
+      bn=0
+      buf[++bn]=$0
+      next
+    }
+    $0 == "# <<< GUTT PATH <<<" {
+      if (in==1) {
+        # matched end, drop buffered block and this end marker
+        in=0
+        bn=0
+        next
+      }
+      # orphan end marker, drop it
+      next
+    }
+    {
+      if (in==1) {
+        buf[++bn]=$0
+        next
+      }
+      # outside managed block, also drop any stray marker lines
+      if ($0 == "# >>> GUTT PATH >>>" || $0 == "# <<< GUTT PATH <<<") next
+      print
+    }
+    END {
+      if (in==1) {
+        # no end marker, keep buffered content but remove markers
+        flush_buf()
+      }
+    }
+  ' "$rcfile" >"$tmp" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to build updated file (rc=$rc).
+
+File:
+$rcfile
+
+Backup:
+$backup"
+    return 0
+  fi
+
+  set +e
+  mv -f -- "$tmp" "$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    msgbox "❌ Failed to write updated file (rc=$rc).
+
+File:
+$rcfile
+
+Backup:
+$backup"
+    return 0
+  fi
+
+  msgbox "✅ Removed managed PATH block.
+
+File:
+$rcfile
+Backup:
+$backup
+
+Open a new terminal (or source the file) if you want to re-check:
+  command -v gutt"
+  GUTT_REQUIRE_RESTART=1
+  return 0
+}
+
+gutt_path_add_managed_block() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    msgbox "Per-user install. Run GUTT as your normal user."
+    return 0
+  fi
+
+  # Adds a managed PATH block to ensure ~/.local/bin is on PATH.
+  # Idempotent: does nothing if the block already exists.
+  local rcfile sh rc
+
+  sh="$(gutt_detect_user_shell)"
+  rcfile="$(gutt_path_rc_file_for_shell)"
+
+  if ! yesno "🧭 Add ~/.local/bin to PATH\n\nShell: $sh\nConfig file: $rcfile\n\nAdd a managed block to ensure 'gutt' can be found in new terminals?"; then
+    return 0
+  fi
+
+  if gutt_path_managed_block_present "$rcfile"; then
+    msgbox "✅ Managed PATH block already present.\n\nFile:\n$rcfile"
+    return 0
+  fi
+
+  set +e
+  mkdir -p -- "$(dirname -- "$rcfile")" 2>/dev/null
+  touch -- "$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    msgbox "❌ Failed to prepare config file (rc=$rc).\n\nFile:\n$rcfile"
+    return 0
+  fi
+
+  set +e
+  {
+    printf '\n# >>> GUTT PATH >>>\n'
+    printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+    printf '# <<< GUTT PATH <<<\n'
+  } >>"$rcfile" 2>/dev/null
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    msgbox "❌ Failed to write PATH block (rc=$rc).\n\nFile:\n$rcfile"
+    return 0
+  fi
+
+  msgbox "✅ Added managed PATH block.\n\nFile:\n$rcfile\n\nOpen a new terminal (or source the file) and try:\n  command -v gutt\n  gutt"
+  return 0
+}
+
+
+gutt_shortcut_install_wrapper() {
+  # Usage: gutt_shortcut_install_wrapper <dest_path> <entry_real>
+  local dest="${1:-}"
+  local entry_real="${2:-}"
+  [[ -n "$dest" && -n "$entry_real" ]] || return 1
+
+  local root
+  root="$(dirname -- "$entry_real" 2>/dev/null || true)"
+
+  local tmp
+  tmp="$(mktemp_gutt)"
+  cat >"$tmp" <<EOF
+#!/usr/bin/env bash
+# GUTT_WRAPPER
+# Generated by GUTT: PATH integration wrapper (do not edit by hand)
+GUTT_ENTRY="$entry_real"
+export GUTT_APP_DIR="$root"
+exec "\$GUTT_ENTRY" "\$@"
+EOF
+
+  chmod 0755 "$tmp" 2>/dev/null || true
+
+  printf '%s
+' "$tmp"
+  return 0
+}
+
+gutt_shortcut_install_user() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    msgbox "Per-user install. Run GUTT as your normal user."
+    return 0
+  fi
+
+  local found p rp ours
+  read -r found p rp ours < <(gutt_shortcut_status)
+
+  # If there's already a foreign gutt, don't overwrite it.
+  if [[ "$found" == "1" && -n "$p" ]]; then
+    case "$p" in
+      "$HOME/.local/bin/gutt" | "$HOME/bin/gutt")
+        # safe to manage
+        ;;
+      *)
+        msgbox "A 'gutt' command already exists on your PATH, but it's in an unexpected location:
+
+$p
+
+For safety, GUTT will not overwrite this.
+
+Remove/rename the existing command first."
+        return 0
+        ;;
+    esac
+  fi
+
+  local entry entry_real dest_dir dest
+  entry="$(gutt_self_realpath || true)"
+  [[ -n "$entry" ]] || { msgbox "Couldn't resolve the current GUTT script path."; return 0; }
+  entry_real="$(readlink -f -- "$entry" 2>/dev/null || printf '%s' "$entry")"
+
+  dest_dir="$HOME/.local/bin"
+  dest="$dest_dir/gutt"
+
+  if ! yesno "🔗 GUTT shortcut
+
+Create/update:
+
+$dest
+
+to point to:
+
+$entry_real
+
+Proceed?"; then
+    return 0
+  fi
+
+  mkdir -p -- "$dest_dir" 2>/dev/null || true
+
+  local tmp
+  tmp="$(gutt_shortcut_install_wrapper "$dest" "$entry_real")" || { msgbox "Failed to build wrapper."; return 0; }
+
+  local _rc
+  set +e
+  install -m 0755 -- "$tmp" "$dest" 2>/dev/null
+  _rc=$?
+  rm -f -- "$tmp" 2>/dev/null || true
+  set -e
+
+  if [[ $_rc -ne 0 ]]; then
+    msgbox "❌ Failed to create/update (rc=$_rc).
+
+Path:
+$dest"
+    return 0
+  fi
+
+  hash -r 2>/dev/null || true
+
+  local cv="" st=""
+  cv="$(command -v gutt 2>/dev/null || true)"
+  st="$(gutt_path_integration_state 2>/dev/null || true)"
+
+  # Phase C: verify immediately and guide if not callable yet.
+  if [[ -z "$cv" || "$st" != "INSTALLED" ]]; then
+    if [[ "$st" == "PARTIAL" || -z "$cv" ]]; then
+      if yesno "✅ Wrapper installed at:
+
+$dest
+
+But it is not callable yet in this shell.
+
+Current state: PARTIAL
+
+Reason: $dest_dir is not on your PATH (or your shell needs a refresh).
+
+Add a managed PATH block now (recommended)?"; then
+        gutt_path_add_managed_block
+      else
+        msgbox "✅ Wrapper installed at:
+
+$dest
+
+Current state: PARTIAL
+
+To finish setup, add this to your shell config and open a new terminal:
+
+  export PATH="\$HOME/.local/bin:\$PATH"
+
+Then run:
+  command -v gutt
+  gutt"
+      fi
+      return 0
+    fi
+
+    msgbox "⚠ Wrapper installed at:
+
+$dest
+
+But 'gutt' currently resolves to:
+$cv
+
+State: ${st:-UNKNOWN}
+
+For safety, GUTT will not change your PATH order. If you want this install to take precedence, adjust PATH so $dest_dir comes before the above location, then open a new terminal."
+    return 0
+  fi
+
+  msgbox "✅ Installed.
+
+Verified:
+  command -v gutt -> $cv
+
+You can now run:
+
+  gutt"
+  return 0
+}
+
+gutt_shortcut_remove() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    msgbox "Per-user install. Run GUTT as your normal user."
+    return 0
+  fi
+
+  local found p rp ours
+  read -r found p rp ours < <(gutt_shortcut_status)
+
+  if [[ "$found" != "1" || -z "$p" ]]; then
+    msgbox "No 'gutt' command was found on your PATH."
+    return 2
+  fi
+
+  local why_block="" removable="0"
+
+  case "$p" in
+    "$HOME/.local/bin/gutt" | "$HOME/bin/gutt")
+      removable="1"
+      ;;
+    "/usr/local/bin/gutt")
+      why_block="This is a system location:
+$p
+
+GUTT will not remove system shortcuts. Please remove it manually (with sudo) if you really want it gone."
+      ;;
+    "/usr/bin/gutt" | "/bin/gutt" | "/sbin/gutt" | "/usr/sbin/gutt")
+      why_block="This appears to be a system-managed binary:
+$p
+
+GUTT will not remove it."
+      ;;
+    *)
+      why_block="This 'gutt' is in an unexpected location:
+$p
+
+For safety, GUTT will not remove it."
+      ;;
+  esac
+
+  if [[ -n "$why_block" || "$removable" != "1" ]]; then
+    msgbox "$why_block"
+    return 0
+  fi
+  local warn=""
+  if [[ "$ours" != "1" ]]; then
+    warn="⚠ Note: This 'gutt' does not appear to point at the current GUTT instance.
+
+"
+  fi
+
+  if ! yesno "${warn}🧹 Remove 'gutt'
+
+Remove this shortcut?
+
+$p"; then
+    return 0
+  fi
+
+  local _rc
+  set +e
+  rm -f -- "$p" 2>/dev/null
+  _rc=$?
+  set -e
+
+  if [[ $_rc -ne 0 ]]; then
+    msgbox "❌ Failed to remove (rc=$_rc).
+
+Path:
+$p"
+    return 0
+  fi
+
+  hash -r 2>/dev/null || true
+  msgbox "✅ Removed.
+
+Path:
+$p"
+  return 0
+}
+
+gutt_manage_path_menu() {
+  local found p rp ours
+  local status_label cmd_path
+
+  while true; do
+local state
+state="$(gutt_path_integration_state)"
+
+status_label="Not installed"
+cmd_path="not found"
+
+case "$state" in
+  INSTALLED)
+    status_label="Installed (this GUTT)"
+    cmd_path="$(command -v gutt 2>/dev/null || echo "gutt")"
+    ;;
+  FOREIGN)
+    status_label="Foreign command"
+    cmd_path="$(command -v gutt 2>/dev/null || echo "gutt")"
+    ;;
+  PARTIAL)
+    status_label="Wrapper present (NOT on PATH)"
+    if [[ -x "$HOME/.local/bin/gutt" ]]; then
+      cmd_path="$HOME/.local/bin/gutt"
+    elif [[ -x "$HOME/bin/gutt" ]]; then
+      cmd_path="$HOME/bin/gutt"
+    else
+      cmd_path="not found"
+    fi
+    ;;
+  UNINSTALLED|*)
+    status_label="Not installed"
+    cmd_path="not found"
+    ;;
+esac
+
+    local hdr
+    hdr=$'Status: '"$status_label"$'
+Command: '"$cmd_path"$'
+
+Choose an action:'
+
+    # Phase E: detect legacy/unmanaged PATH edits (report-first)
+    local sh rcfile health unmanaged warn
+    sh="$(gutt_detect_user_shell)"
+    rcfile="$(gutt_path_rc_file_for_shell)"
+    health="$(gutt_path_managed_block_health "$rcfile")"
+    unmanaged="$(gutt_path_scan_unmanaged_lines "$rcfile")"
+    warn=""
+    if [[ "$health" == "MULTIPLE" || "$health" == "MALFORMED" ]]; then
+      warn+=$'
+⚠ Managed PATH block markers need attention (run Scan).'
+    fi
+    if [[ -n "$unmanaged" ]]; then
+      warn+=$'
+⚠ Legacy/unmanaged .local/bin PATH edits detected (run Scan).'
+    fi
+    if [[ -n "$warn" ]]; then
+      hdr+="$warn"
+    fi
+
+    local usr_desc add_desc hint choice
+    usr_desc="Install/update user shortcut (~/.local/bin/gutt)"
+    add_desc="Add ~/.local/bin to PATH (managed block)"
+    hint=""
+
+    case "$state" in
+      INSTALLED)
+        usr_desc="Reinstall/update user shortcut (~/.local/bin/gutt)"
+        hint=$'\n\n✅ PATH already resolves gutt. You are good.'
+        ;;
+      PARTIAL)
+        add_desc="Add ~/.local/bin to PATH (fix PARTIAL state)"
+        hint=$'\n\nNext step: add ~/.local/bin to PATH so "gutt" works in new shells.'
+        ;;
+      FOREIGN)
+        usr_desc="Install user shortcut (~/.local/bin/gutt) (will not override foreign gutt)"
+        hint=$'\n\n⚠ A different "gutt" is on PATH. GUTT will not overwrite it.'
+        ;;
+      UNINSTALLED)
+        hint=$'\n\nTip: install the shortcut, then add ~/.local/bin to PATH if needed.'
+        ;;
+    esac
+
+    choice="$(menu "$APP_NAME $VERSION" "🔗 Manage PATH integration
+
+$hdr$hint" \
+      "USR"    "$usr_desc" \
+      "ADD"    "$add_desc" \
+      "SCAN"   "Scan shell config for legacy/unmanaged PATH edits" \
+      "REPAIR" "Repair managed PATH block (between markers)" \
+      "PURGE"  "Recovery: purge and rebuild managed PATH block" \
+      "REM"    "Remove shortcut (restart terminal)" \
+      "RMBLK"  "Remove managed PATH block (restart terminal)" \
+      "HOW"    "Show manual guidance" \
+      "BACK"   "Back")" || return 0
+
+    case "$choice" in
+      USR) gutt_run_action gutt_shortcut_install_user ;;
+      ADD) gutt_run_action gutt_path_add_managed_block ;;
+      SCAN) gutt_run_action gutt_path_show_scan_report ;;
+      REPAIR) gutt_run_action gutt_path_repair_managed_block ;;
+      PURGE) gutt_run_action gutt_path_purge_and_rebuild_managed_block ;;
+      REM)
+        local rc=0
+        set +e
+        gutt_shortcut_remove
+        rc=$?
+        set -e
+        [[ $rc -eq 2 ]] && continue
+        ;;
+
+      RMBLK) gutt_run_action gutt_path_remove_managed_block ;;
+      HOW)
+        msgbox "Manual guidance (no writes)
+
+User install:
+  mkdir -p \"$HOME/.local/bin\"
+  install -m 0755 <this-file> \"$HOME/.local/bin/gutt\"
+
+If ~/.local/bin isn't on PATH:
+  export PATH=\"\$HOME/.local/bin:\$PATH\"
+
+Managed block (recommended):
+  # >>> GUTT PATH >>>
+  export PATH=\"\$HOME/.local/bin:\$PATH\"
+  # <<< GUTT PATH <<<"
+        ;;
+      BACK) return 0 ;;
+    esac
+  done
+}
+
 action_settings_menu() {
   while true; do
     local pull_mode fetch_before_push recent_limit allow_backup
@@ -2686,22 +4256,32 @@ action_settings_menu() {
     recent_limit="$(cfg_get recent_limit 10)"
     allow_backup="$(cfg_get offer_backup_tag_before_danger 1)"
 
+    local state label
+    state="$(gutt_path_integration_state)"
+    label="$(gutt_path_integration_label "$state")"
+
     local choice
     choice="$(menu "$APP_NAME $VERSION" "Settings" \
       "PULL" "Default pull mode: $pull_mode" \
       "FETCH" "Auto fetch before push: $fetch_before_push" \
       "REC" "Recent repos limit: $recent_limit" \
       "TAG" "Offer backup tag before danger: $allow_backup" \
+      "PATH" "$label" \
       "BACK" "Back")" || return 0
 
     case "$choice" in
       PULL)
-        local pm
+        local pm rc=0 had_e=0
+        [[ $- == *e* ]] && had_e=1
+        set +e
         pm="$(whiptail --title "$APP_NAME $VERSION" --radiolist "Select default pull mode" 14 70 3 \
           "ff-only" "Fast-forward only" $( [[ "$pull_mode" == "ff-only" ]] && echo ON || echo OFF ) \
           "merge" "Merge (default)" $( [[ "$pull_mode" == "merge" ]] && echo ON || echo OFF ) \
           "rebase" "Rebase" $( [[ "$pull_mode" == "rebase" ]] && echo ON || echo OFF ) \
-          3>&1 1>&2 2>&3)" || continue
+          3>&1 1>&2 2>&3)"
+        rc=$?
+        ((had_e)) && set -e
+        [[ $rc -eq 0 ]] || continue
         cfg_set default_pull_mode "$pm"
         ;;
       FETCH)
@@ -2715,6 +4295,9 @@ action_settings_menu() {
         ;;
       TAG)
         if [[ "$allow_backup" == "1" ]]; then cfg_set offer_backup_tag_before_danger 0; else cfg_set offer_backup_tag_before_danger 1; fi
+        ;;
+      PATH)
+        gutt_manage_path_menu
         ;;
       BACK) return 0 ;;
     esac
@@ -2756,7 +4339,7 @@ vnext_squash_merge_into_main() {
   fi
 
   # Build a commit summary of what will be squashed
-  logtmp="$(mktemp)"
+  logtmp="$(mktemp_gutt)"
   (cd "$repo" && git log --oneline --decorate "$main..$branch" 2>/dev/null) >"$logtmp" || true
 
   if [[ ! -s "$logtmp" ]]; then
@@ -2765,7 +4348,7 @@ vnext_squash_merge_into_main() {
     return 0
   fi
 
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   {
     echo "About to SQUASH MERGE"
     echo
@@ -2797,7 +4380,7 @@ vnext_squash_merge_into_main() {
 
   # Optional smoke tests (default NO)
   if whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Run smoke tests BEFORE merging?" 12 78 3>&1 1>&2 2>&3; then
-    tmp2="$(mktemp)"
+    tmp2="$(mktemp_gutt)"
     vnext_smoke_tests_internal "$repo" "$tmp2"
     rc=$?
     textbox "$tmp2"
@@ -2831,7 +4414,7 @@ vnext_squash_merge_into_main() {
   msgbox "Created local safety tag:\n\n$tag\n\n(This stays local unless you push tags.)"
 
   # Perform the squash merge
-  tmp2="$(mktemp)"
+  tmp2="$(mktemp_gutt)"
   (cd "$repo" && git merge --squash "$branch") >"$tmp2" 2>&1
   rc=$?
 
@@ -2853,7 +4436,7 @@ vnext_squash_merge_into_main() {
     return 1
   }
 
-  tmp2="$(mktemp)"
+  tmp2="$(mktemp_gutt)"
   (cd "$repo" && git commit -m "$msg") >"$tmp2" 2>&1
   rc=$?
   if [[ -s "$tmp2" ]]; then
@@ -2935,15 +4518,15 @@ vnext_common_menu() {
       "BACK" "Back")" || return 0
 
     case "$choice" in
-      STAT) action_status_summary "$repo" ;;
-      PULL) action_pull_safe_update "$repo" ;;
-      COMM) action_checkpoint_commit "$repo" ;;
-      PUSH) vnext_push_menu "$repo" ;;
-      CFB)  vnext_create_feature_branch "$repo" ;;
-      SWB)  action_branch_switch "$repo" ;;
-      SQM)  vnext_squash_merge_into_main "$repo" ;;
-      TEST) vnext_run_smoke_tests "$repo" ;;
-      STSH) action_stash_push_quick "$repo" ;;
+      STAT) gutt_run_action action_status_summary "$repo" ;;
+      PULL) gutt_run_action action_pull_safe_update "$repo" ;;
+      COMM) gutt_run_action action_checkpoint_commit "$repo" ;;
+      PUSH) gutt_run_action vnext_push_menu "$repo" ;;
+      CFB) gutt_run_action vnext_create_feature_branch "$repo" ;;
+      SWB) gutt_run_action action_branch_switch "$repo" ;;
+      SQM) gutt_run_action vnext_squash_merge_into_main "$repo" ;;
+      TEST) gutt_run_action vnext_run_smoke_tests "$repo" ;;
+      STSH) gutt_run_action action_stash_push_quick "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -2967,16 +4550,16 @@ vnext_status_info_menu() {
       "BACK" "Back")" || return 0
 
     case "$choice" in
-      DASH) action_show_commit "$repo" ;; # closest existing quick info
-      STAT) action_full_status "$repo" ;;
-      LOG)  run_git_capture "$repo" git log --graph --oneline --decorate --all -n 50 ;;
-      DIFF) vnext_diff_menu "$repo" ;;
-      RMT)  vnext_remote_info "$repo" ;;
-      AHD) vnext_ahead_behind "$repo" ;;
-      BLC)  vnext_branch_last_commit_details "$repo" ;;
-      UNTR) vnext_untracked_summary "$repo" ;;
-      REP)  vnext_repo_details "$repo" ;;
-      LOGS) action_log_menu "$repo" ;;
+      DASH) show_dashboard "$repo" ;; # repo summary dashboard
+      STAT) gutt_run_action action_full_status "$repo" ;;
+      LOG) gutt_run_action run_git_capture "$repo" git log --graph --oneline --decorate --all -n 50 ;;
+      DIFF) gutt_run_action vnext_diff_menu "$repo" ;;
+      RMT) gutt_run_action vnext_remote_info "$repo" ;;
+      AHD) gutt_run_action vnext_ahead_behind "$repo" ;;
+      BLC) gutt_run_action vnext_branch_last_commit_details "$repo" ;;
+      UNTR) gutt_run_action vnext_untracked_summary "$repo" ;;
+      REP) gutt_run_action vnext_repo_details "$repo" ;;
+      LOGS) gutt_run_action action_log_menu "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -2992,8 +4575,8 @@ Repo:
 $repo"       "UNST" "Unstaged diff (working tree)"       "STAG" "Staged diff (--staged)"       "BACK" "Back")" || return 0
 
     case "$choice" in
-      UNST) run_git_capture "$repo" git diff ;;
-      STAG) run_git_capture "$repo" git diff --staged ;;
+      UNST) gutt_run_action run_git_capture "$repo" git diff ;;
+      STAG) gutt_run_action run_git_capture "$repo" git diff --staged ;;
       BACK) return 0 ;;
     esac
   done
@@ -3020,14 +4603,14 @@ Safe branch visibility tools first." \
       "BACK" "Back")" || return 0
 
     case "$choice" in
-      LST) vnext_list_branches "$repo" ;;
-      NEW) vnext_create_branch "$repo" ;;
-      SWI) action_branch_switch "$repo" ;;
-      REN) vnext_rename_current_branch "$repo" ;;
-      UPT) vnext_upstream_tracking "$repo" ;;
-      DEL) vnext_delete_branch "$repo" ;;
-      PRN) vnext_prune_remote_tracking "$repo" ;;
-      LEG) action_branch_menu "$repo" ;;
+      LST) gutt_run_action vnext_list_branches "$repo" ;;
+      NEW) gutt_run_action vnext_create_branch "$repo" ;;
+      SWI) gutt_run_action action_branch_switch "$repo" ;;
+      REN) gutt_run_action vnext_rename_current_branch "$repo" ;;
+      UPT) gutt_run_action vnext_upstream_tracking "$repo" ;;
+      DEL) gutt_run_action vnext_delete_branch "$repo" ;;
+      PRN) gutt_run_action vnext_prune_remote_tracking "$repo" ;;
+      LEG) gutt_run_action action_branch_menu "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -3071,7 +4654,7 @@ vnext_prune_remote_tracking() {
     remote="$(pick_remote "$repo")" || { msgbox "No remotes found."; return 0; }
   fi
 
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp_gutt)"
   (cd "$repo" && git remote prune "$remote" --dry-run) >"$tmp" 2>&1 || true
 
   if [[ ! -s "$tmp" ]]; then
@@ -3139,7 +4722,7 @@ $upstream" \
         # If the guessed remote branch doesn't exist, offer a picker from that remote.
         if ! (cd "$repo" && git show-ref --verify --quiet "refs/remotes/$remote/$cur"); then
           local tmp items=() rb
-          tmp="$(mktemp)"
+          tmp="$(mktemp_gutt)"
           (cd "$repo" && git for-each-ref --format='%(refname:strip=3)' "refs/remotes/$remote" 2>/dev/null | grep -v '^HEAD$') >"$tmp" || true
           if [[ ! -s "$tmp" ]]; then
             rm -f "$tmp"
@@ -3153,7 +4736,13 @@ $upstream" \
           done <"$tmp"
           rm -f "$tmp"
 
-          rb="$(whiptail --title "$APP_NAME $VERSION" --menu "Select remote branch for upstream ($remote)" 20 78 12 "${items[@]}" 3>&1 1>&2 2>&3)" || continue
+          local rc=0 had_e=0
+          [[ $- == *e* ]] && had_e=1
+          set +e
+          rb="$(whiptail --title "$APP_NAME $VERSION" --menu "Select remote branch for upstream ($remote)" 20 78 12 "${items[@]}" 3>&1 1>&2 2>&3)"
+          rc=$?
+          ((had_e)) && set -e
+          [[ $rc -eq 0 ]] || continue
           target="$remote/$rb"
         fi
 
@@ -3218,7 +4807,7 @@ vnext_create_branch() {
 vnext_list_branches() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
 
   (
     cd "$repo" 2>/dev/null || exit 0
@@ -3289,7 +4878,7 @@ vnext_list_branches() {
 vnext_remote_info() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (
     cd "$repo" 2>/dev/null || exit 0
 
@@ -3341,7 +4930,7 @@ vnext_remote_info() {
 vnext_ahead_behind() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (
     cd "$repo" 2>/dev/null || exit 0
 
@@ -3387,7 +4976,7 @@ vnext_ahead_behind() {
 vnext_branch_last_commit_details() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (
     cd "$repo" 2>/dev/null || exit 0
 
@@ -3430,7 +5019,7 @@ vnext_branch_last_commit_details() {
 vnext_repo_details() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (
     cd "$repo" 2>/dev/null || exit 0
 
@@ -3479,11 +5068,13 @@ vnext_repo_details() {
   ) >"$tmp"
 
   textbox "$APP_NAME $VERSION" "$tmp"
+  rm -f "$tmp"
+}
 
 vnext_untracked_summary() {
   local repo="$1"
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_gutt)"
   (
     cd "$repo" 2>/dev/null || exit 0
 
@@ -3549,10 +5140,6 @@ vnext_untracked_summary() {
   textbox "$tmp"
   rm -f "$tmp"
 }
-  rm -f "$tmp"
-}
-
-
 
 vnext_commit_menu() {
   local repo="$1"
@@ -3560,11 +5147,77 @@ vnext_commit_menu() {
   action_commit_menu "$repo"
 }
 
+vnext_upstream_health_view() {
+  local repo="$1"
+  local tmp branch upstream origin_url ab ahead behind
+
+  tmp="$(mktemp_gutt)"
+
+  branch="$(git_current_branch "$repo")"
+  upstream="$(git_upstream "$repo")"
+
+  if have_origin_remote "$repo"; then
+    origin_url="$(cd "$repo" && git remote get-url origin 2>/dev/null || true)"
+  else
+    origin_url=""
+  fi
+
+  ahead="?"
+  behind="?"
+  if [[ -n "$upstream" ]]; then
+    ab="$(cd "$repo" && git rev-list --left-right --count "HEAD...@{u}" 2>/dev/null || true)"
+    ahead="${ab%% *}"
+    behind="${ab##* }"
+    [[ -z "$ahead" ]] && ahead="0"
+    [[ -z "$behind" ]] && behind="0"
+  fi
+
+  {
+    printf '%s\n' "Upstream health (read-only)"
+    printf '%s\n' "Repo: $repo"
+    printf '\n'
+
+    printf '%s\n' "== Remotes =="
+    if [[ -n "$origin_url" ]]; then
+      printf 'origin: %s\n' "$origin_url"
+    else
+      printf '%s\n' "origin: (not set)"
+    fi
+    printf '\n'
+
+    printf '%s\n' "== Branch / upstream =="
+    if git_is_detached "$repo"; then
+      printf '%s\n' "HEAD state: detached"
+    else
+      printf 'Branch: %s\n' "${branch:-unknown}"
+    fi
+
+    if [[ -n "$upstream" ]]; then
+      printf 'Upstream: %s\n' "$upstream"
+      printf 'Ahead/Behind: %s ahead, %s behind\n' "$ahead" "$behind"
+    else
+      printf '%s\n' "Upstream: (none set)"
+      printf '%s\n' "Ahead/Behind: (n/a)"
+      printf '\n'
+      printf '%s\n' "Tip: Use 'Set / view upstream' to connect this branch to origin."
+    fi
+
+    printf '\n'
+    printf '%s\n' "Notes:"
+    printf '%s\n' "- This view is read-only."
+    printf '%s\n' "- Ahead/Behind uses your configured upstream (@{u})."
+  } >"$tmp"
+
+  textbox "$tmp" || true
+  rm -f "$tmp"
+}
+
 vnext_sync_menu() {
   local repo="$1"
   while true; do
     local choice
     choice="$(menu "$APP_NAME $VERSION" "Sync (Pull/Push/Fetch)\n\nRepo:\n$repo" \
+      "HLTH" "Upstream health (read-only)" \
       "PULL" "Pull (fast-forward only)" \
       "FETC" "Fetch" \
       "PUSH" "Push" \
@@ -3573,11 +5226,12 @@ vnext_sync_menu() {
       "BACK" "Back")" || return 0
 
     case "$choice" in
-      PULL) action_pull_safe_update "$repo" ;;
-      FETC) action_fetch "$repo" ;;
-      PUSH) vnext_push_menu "$repo" ;;
-      UPST) action_set_upstream "$repo" ;;
-      FFPS) action_force_push "$repo" ;;
+      HLTH) gutt_run_action vnext_upstream_health_view "$repo" ;;
+      PULL) gutt_run_action action_pull_safe_update "$repo" ;;
+      FETC) gutt_run_action action_fetch "$repo" ;;
+      PUSH) gutt_run_action vnext_push_menu "$repo" ;;
+      UPST) gutt_run_action action_set_upstream "$repo" ;;
+      FFPS) gutt_run_action action_force_push "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -3599,7 +5253,7 @@ vnext_tags_menu() {
   local repo="$1"
   while true; do
     local choice
-    choice="$(menu "$APP_NAME $VERSION" "Tags & Releases (vNext scaffold)\n\nRepo:\n$repo" \
+    choice="$(menu "$APP_NAME $VERSION" "Tags & Known-Good (vNext scaffold)\n\nRepo:\n$repo" \
       "LIST" "List tags" \
       "MKOK" "Mark current as known-good" \
       "CRAT" "Create annotated tag" \
@@ -3609,12 +5263,12 @@ vnext_tags_menu() {
       "BACK" "Back")" || return 0
 
     case "$choice" in
-      LIST) vnext_list_tags "$repo" ;;
-      MKOK) vnext_mark_known_good "$repo" ;;
-      CRAT) vnext_create_annotated_tag "$repo" ;;
-      DELT) vnext_delete_local_tag "$repo" ;;
-      PUSH) vnext_push_tag_to_origin "$repo" ;;
-      PUSA) vnext_push_all_tags "$repo" ;;
+      LIST) gutt_run_action vnext_list_tags "$repo" ;;
+      MKOK) gutt_run_action vnext_mark_known_good "$repo" ;;
+      CRAT) gutt_run_action vnext_create_annotated_tag "$repo" ;;
+      DELT) gutt_run_action vnext_delete_local_tag "$repo" ;;
+      PUSH) gutt_run_action vnext_push_tag_to_origin "$repo" ;;
+      PUSA) gutt_run_action vnext_push_all_tags "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -3622,14 +5276,623 @@ vnext_tags_menu() {
 
 vnext_hygiene_menu() {
   local repo="$1"
-  # Reuse existing hygiene assistant menu
-  action_hygiene_menu "$repo"
+
+  # Phase 10.1 (read-only): Hygiene & Cleanup summaries
+  while true; do
+    local choice
+    choice="$(menu "Hygiene & Cleanup (read-only)" "Read-only hygiene views\n\nChoose an action" \
+      "SUM"   "Show untracked / ignored / junk folders summary" \
+      "EXP"   "Export hygiene report to a text file" \
+      "REST"  "Restore file(s) (discard unstaged changes)" \
+      "CLEAN" "Clean untracked files/dirs (guarded)" \
+      "BACK"  "Back")" || return 0
+
+    case "$choice" in
+      SUM) gutt_run_action vnext_hygiene_cleanup_summary "$repo" ;;
+      EXP) gutt_run_action vnext_hygiene_export_report "$repo" ;;
+      REST) gutt_run_action vnext_hygiene_restore_files "$repo" ;;
+      CLEAN) gutt_run_action vnext_hygiene_clean_untracked "$repo" ;;
+      BACK)  return 0 ;;
+    esac
+  done
+}
+
+vnext_hygiene_cleanup_summary() {
+  local repo="$1"
+  local tmp
+  tmp="$(mktemp_gutt)"
+
+  # Keep it fast and safe: show counts + samples, and only size common junk folders.
+  local untracked_count ignored_count
+  untracked_count="$(cd "$repo" && git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ' || true)"
+  ignored_count="$(cd "$repo" && git ls-files --others -i --exclude-standard 2>/dev/null | wc -l | tr -d ' ' || true)"
+
+  {
+    printf '%s\n' "Hygiene & Cleanup summary (read-only)"
+    printf '%s\n' "Repo: $repo"
+    printf '%s\n' ""
+
+    printf '%s\n' "== Untracked files =="
+    printf 'Count: %s\n' "${untracked_count:-0}"
+    printf '%s\n' "Sample (up to 60):"
+    (cd "$repo" && git ls-files --others --exclude-standard 2>/dev/null | head -n 60) || true
+    printf '%s\n' ""
+
+    printf '%s\n' "== Ignored files (per .gitignore etc) =="
+    printf 'Count: %s\n' "${ignored_count:-0}"
+    printf '%s\n' "Sample (up to 60):"
+    (cd "$repo" && git ls-files --others -i --exclude-standard 2>/dev/null | head -n 60) || true
+    printf '%s\n' ""
+
+    printf '%s\n' "== Common junk folders (detected) =="
+    printf '%s\n' "Searched up to depth 4 (excluding .git). Sizes via du -sh."
+    printf '%s\n' ""
+
+    local found_any=0
+    local name
+    for name in node_modules dist build out __pycache__ .pytest_cache .mypy_cache .tox .venv venv .cache coverage .next .nuxt target vendor .terraform; do
+      # Find matching dirs (limit depth for performance)
+      while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        found_any=1
+        local sz
+        sz="$(cd "$repo" && du -sh "$path" 2>/dev/null | awk '{print $1}' || true)"
+        printf '%-10s %s\n' "${sz:--}" "$path"
+      done < <(cd "$repo" && find . -maxdepth 4 -path './.git' -prune -o -type d -name "$name" -print 2>/dev/null | head -n 40)
+    done
+
+    if [[ "$found_any" -eq 0 ]]; then
+      printf '%s\n' "(none of the common junk folders were found in the first 4 levels)"
+    fi
+
+    printf '%s\n' ""
+    printf '%s\n' "Notes:"
+    printf '%s\n' "- This is Phase 10.1 and does not change anything."
+    printf '%s\n' "- Later phases can add guarded cleanup actions (default NO), one at a time."
+  } >"$tmp"
+
+  textbox "$tmp"
+  rm -f "$tmp"
+}
+
+vnext_hygiene_export_report() {
+  local repo="$1"
+  local dest default_dest ts
+  ts="$(date +%Y%m%d-%H%M%S 2>/dev/null || true)"
+  default_dest="/tmp/gutt-hygiene-${ts:-report}.txt"
+
+  dest="$(inputbox "Export hygiene report\n\nThis is read-only and writes a report file.\n\nEnter output path:" "$default_dest")" || return 0
+
+  # Basic sanity: refuse empty
+  if [[ -z "${dest// }" ]]; then
+    msgbox "No output path provided."
+    return 0
+  fi
+
+  # Build report (similar to 10.1 summary, with slightly larger samples).
+  local untracked_count ignored_count
+  untracked_count="$(cd "$repo" && git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ' || true)"
+  ignored_count="$(cd "$repo" && git ls-files --others -i --exclude-standard 2>/dev/null | wc -l | tr -d ' ' || true)"
+
+  {
+    printf '%s\n' "GUTT Hygiene report (Phase 10.2 export)"
+    printf '%s\n' "Generated: $(date -R 2>/dev/null || date 2>/dev/null || true)"
+    printf '%s\n' "Repo: $repo"
+    printf '%s\n' ""
+
+    printf '%s\n' "== Untracked files =="
+    printf 'Count: %s\n' "${untracked_count:-0}"
+    printf '%s\n' "Sample (up to 500):"
+    (cd "$repo" && git ls-files --others --exclude-standard 2>/dev/null | head -n 500) || true
+    printf '%s\n' ""
+
+    printf '%s\n' "== Ignored files (per .gitignore etc) =="
+    printf 'Count: %s\n' "${ignored_count:-0}"
+    printf '%s\n' "Sample (up to 500):"
+    (cd "$repo" && git ls-files --others -i --exclude-standard 2>/dev/null | head -n 500) || true
+    printf '%s\n' ""
+
+    printf '%s\n' "== Common junk folders (depth <= 4, excluding .git) =="
+    printf '%s\n' "Size shown via du -sh for each folder found."
+    printf '%s\n' ""
+
+    local -a junk_names
+    junk_names=(
+      "node_modules"
+      "dist"
+      "build"
+      "__pycache__"
+      ".pytest_cache"
+      ".mypy_cache"
+      ".ruff_cache"
+      ".venv"
+      "venv"
+      ".tox"
+      ".cache"
+      ".DS_Store"
+      "coverage"
+      ".coverage"
+    )
+
+    local found_any=0
+    local name d
+    for name in "${junk_names[@]}"; do
+      while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        found_any=1
+        # du can be slow; keep it limited and safe.
+        (cd "$repo" && du -sh "$d" 2>/dev/null) || printf '%s\n' "(size unavailable) $d"
+      done < <(cd "$repo" && find . -path "./.git" -prune -o -maxdepth 4 -type d -name "$name" -print 2>/dev/null | sed 's|^\./||' || true)
+    done
+
+    if [[ "$found_any" -eq 0 ]]; then
+      printf '%s\n' "(none of the common junk folders were found in the first 4 levels)"
+    fi
+
+    printf '%s\n' ""
+    printf '%s\n' "Notes:"
+    printf '%s\n' "- Export is non-destructive; it only writes this report file."
+    printf '%s\n' "- Cleanup actions (if/when added) must be guarded and default NO."
+  } >"$dest" 2>/dev/null || {
+    msgbox "Failed to write report:\n\n$dest"
+    return 0
+  }
+
+  if yesno "Report written:\n\n$dest\n\nOpen it now?" ; then
+    textbox "$dest"
+  else
+    msgbox "Done.\n\nReport saved to:\n$dest"
+  fi
+}
+
+vnext_hygiene_restore_files() {
+  local repo="$1"
+
+  # Build candidate list: tracked files with unstaged changes (worktree changes).
+  local porcelain
+  porcelain="$(cd "$repo" && git status --porcelain=v1 2>/dev/null || true)"
+
+  local items=()
+  local count=0
+  local line x y path st
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+
+    # Skip untracked; git restore won't help there.
+    if [[ "${line:0:2}" == "??" ]]; then
+      continue
+    fi
+
+    x="${line:0:1}"
+    y="${line:1:1}"
+
+    # We are restoring the working tree only. If there's no worktree change, skip.
+    [[ "$y" != " " ]] || continue
+
+    st="${line:0:2}"
+    path="${line:3}"
+
+    # Handle rename display: "old -> new" (use new path).
+    if [[ "$path" == *" -> "* ]]; then
+      path="${path##* -> }"
+    fi
+
+    # Trim any surrounding whitespace
+    path="${path#"${path%%[![:space:]]*}"}"
+    path="${path%"${path##*[![:space:]]}"}"
+    [[ -n "$path" ]] || continue
+
+    items+=("$path" "$st" "OFF")
+    ((count++))
+
+    # Hard cap to keep UI responsive.
+    if (( count >= 400 )); then
+      break
+    fi
+  done <<<"$porcelain"
+
+  if (( count == 0 )); then
+    msgbox "No tracked files with unstaged changes were found.\n\nTip:\n- Untracked files (??) are not restored by git restore.\n- Staged-only changes won't appear here because there are no working-tree edits."
+    return 0
+  fi
+
+  local selected rc=0 had_e=0
+  [[ $- == *e* ]] && had_e=1
+  set +e
+  selected="$(whiptail --title "$APP_NAME $VERSION" --separate-output --checklist "Restore file(s) (discard UNSTAGED changes)\n\nThis will run:\n  git restore -- <paths>\n\nMeaning (plain English):\n- Your working copy for those files will be reset back to the INDEX (the last staged version).\n- Any STAGED changes remain staged.\n- Untracked files are unaffected.\n\nSelect file(s) to restore:" 22 95 14 "${items[@]}" 3>&1 1>&2 2>&3)"
+  rc=$?
+  ((had_e)) && set -e
+  [[ $rc -eq 0 ]] || return 0
+
+  [[ -n "${selected//$'\n'/}" ]] || { msgbox "Nothing selected."; return 0; }
+  local -a paths=()
+  mapfile -t paths <<<"$selected"
+
+  local summary
+  summary=$(
+    printf '%s\n' "You are about to discard UNSTAGED changes in your working copy for:"
+    printf '%s\n' ""
+    for p in "${paths[@]}"; do
+      printf '  - %s\n' "$p"
+    done
+    printf '%s\n' ""
+    printf '%s\n' "This will run:"
+    printf '  git restore -- %s\n' "$(printf '%q ' "${paths[@]}")"
+    printf '%s\n' ""
+    printf '%s\n' "Proceed?"
+  )
+
+  if whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "$summary" 22 95 3>&1 1>&2 2>&3; then
+    offer_backup_tag "$repo"
+    (cd "$repo" && git restore -- "${paths[@]}") || true
+    msgbox "Restore complete.\n\nTip:\n- If you need to undo STAGED changes, use the staging menu (unstage or discard) or wait for the staged-restore helper phase."
+  else
+    msgbox "Cancelled."
+  fi
+}
+
+
+
+
+vnext_hygiene_clean_untracked() {
+  local repo="$1"
+
+  local preview tmp_out
+  preview="$(mktemp_gutt)"
+  tmp_out="$(mktemp_gutt)"
+
+  {
+    printf '%s\n' "GUTT: Clean untracked (guarded)"
+    printf '%s\n' "Repo: $repo"
+    printf '%s\n' ""
+    printf '%s\n' "Preview only (no changes yet). This is what git clean would remove:"
+    printf '%s\n' ""
+    (cd "$repo" && git clean -nd 2>/dev/null) || true
+  } >"$preview"
+
+  # If there's nothing to clean, git clean prints nothing.
+  if ! grep -qE '^(Would remove |Would skip repository )' "$preview"; then
+    msgbox "Nothing to clean.\n\nNo untracked files/dirs were listed by:\n  git clean -nd"
+    rm -f "$preview" "$tmp_out"
+    return 0
+  fi
+
+  textbox "$preview" || true
+
+  if ! yesno "About to permanently DELETE untracked files/dirs listed in the preview.\n\nThis will run:\n  git clean -fd\n\nNotes:\n- This does NOT touch tracked files.\n- This does NOT remove ignored files (unless you later add -x).\n- This cannot be undone.\n\nProceed?"; then
+    rm -f "$preview" "$tmp_out"
+    msgbox "Cancelled."
+    return 0
+  fi
+
+  offer_backup_tag "$repo"
+
+  if ! confirm_phrase "Final confirmation required.\n\nType CLEAN to permanently delete the untracked items shown in the preview." "CLEAN"; then
+    rm -f "$preview" "$tmp_out"
+    msgbox "Cancelled."
+    return 0
+  fi
+
+  {
+    printf '%s\n' "git clean output:"
+    printf '%s\n' ""
+    (cd "$repo" && git clean -fd 2>&1) || true
+  } >"$tmp_out"
+
+  textbox "$tmp_out" || msgbox "Clean complete."
+
+  rm -f "$preview" "$tmp_out"
+}
+
+
+vnext_show_known_good_tags() {
+  local repo="$1"
+  local head tags
+  head="$(cd "$repo" && git rev-parse HEAD 2>/dev/null || true)"
+  tags="$(cd "$repo" && git tag --list 'gutt/known-good-*' 2>/dev/null || true)"
+
+  if [[ -z "$tags" ]]; then
+    msgbox "Known-good tags" "No known-good tags found.
+
+Expected pattern: gutt/known-good-*"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp_gutt)"
+  {
+    printf '%s\n' "Known-good tags (most recent first)"
+    printf '%s\n' "Pattern: gutt/known-good-*"
+    printf '%s\n' ""
+    printf '%-34s %-10s %-12s %-5s %s\n' "TAG" "COMMIT" "DATE" "HEAD" "SUBJECT"
+    printf '%s\n' "--------------------------------------------------------------------------------"
+    local tag commit date subj headmark
+    # Sort by commit date (newest first)
+    while IFS= read -r tag; do
+      [[ -z "$tag" ]] && continue
+      commit="$(cd "$repo" && git rev-parse "${tag}^{commit}" 2>/dev/null || true)"
+      date="$(cd "$repo" && git show -s --format='%ad' --date=short "$tag" 2>/dev/null || true)"
+      subj="$(cd "$repo" && git show -s --format='%s' "$tag" 2>/dev/null || true)"
+      headmark="no"
+      [[ -n "$head" && -n "$commit" && "$commit" == "$head" ]] && headmark="YES"
+      printf '%-34s %-10s %-12s %-5s %s\n' "$tag" "${commit:0:8}" "$date" "$headmark" "$subj"
+    done < <(cd "$repo" && git tag --list 'gutt/known-good-*' --sort=-creatordate 2>/dev/null || true)
+    printf '%s\n' ""
+    printf '%s\n' "Tip: If you need to recover, Phase 9.3 will guide you to a known-good tag safely."
+  } >"$tmp"
+  textbox "$tmp"
+  rm -f "$tmp"
+}
+
+vnext_show_recovery_checklist() {
+  local repo="$1"
+
+  local branch detached dirty upstream ahead behind stash_count
+  branch="$(git_current_branch "$repo")"
+  detached="no"
+  [[ "$branch" == "HEAD" || -z "$branch" ]] && detached="YES"
+
+  dirty="no"
+  git_has_changes "$repo" && dirty="YES"
+
+  stash_count="$(cd "$repo" && git stash list 2>/dev/null | wc -l | tr -d ' ' || true)"
+  upstream="$(cd "$repo" && git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)"
+
+  ahead="?"
+  behind="?"
+  if [[ -n "$upstream" ]]; then
+    local counts
+    counts="$(cd "$repo" && git rev-list --left-right --count "${upstream}...HEAD" 2>/dev/null || true)"
+    behind="${counts%% *}"
+    ahead="${counts##* }"
+  fi
+
+  local tmp
+  tmp="$(mktemp_gutt)"
+  {
+    printf '%s\n' "Recovery checklist (read-only)"
+    printf '%s\n' ""
+    printf '%s\n' "1) Where am I?"
+    printf '   - Branch: %s\n' "${branch:-unknown}"
+    printf '   - Detached HEAD: %s\n' "$detached"
+    printf '%s\n' ""
+    printf '%s\n' "2) Is my working tree clean?"
+    printf '   - Uncommitted changes: %s\n' "$dirty"
+    printf '%s\n' ""
+    printf '%s\n' "3) Do I have anything stashed?"
+    printf '   - Stash entries: %s\n' "${stash_count:-0}"
+    printf '%s\n' ""
+    printf '%s\n' "4) Is upstream set and am I ahead/behind?"
+    if [[ -n "$upstream" ]]; then
+      printf '   - Upstream: %s\n' "$upstream"
+      printf '   - Behind:   %s\n' "$behind"
+      printf '   - Ahead:    %s\n' "$ahead"
+    else
+      printf '%s\n' "   - Upstream: (none set)"
+      printf '%s\n' "   - Tip: set upstream before doing sync operations."
+    fi
+    printf '%s\n' ""
+    printf '%s\n' "Suggested safe sequence (human steps):"
+    printf '%s\n' "  A) git status -sb"
+    printf '%s\n' "  B) If dirty: decide whether to commit, stash, or discard"
+    printf '%s\n' "  C) Fetch first, then review ahead/behind"
+    printf '%s\n' "  D) Only then consider recovery actions (known-good tag, new branch, etc.)"
+    printf '%s\n' ""
+    printf '%s\n' "Notes:"
+    printf '%s\n' "- This view does not change anything."
+    printf '%s\n' "- Phase 9.3 offers a guided known-good tag checkout flow (guarded, default NO)."
+  } >"$tmp"
+  textbox "$tmp"
+  rm -f "$tmp"
+}
+
+vnext_show_emergency_revert_notes() {
+  local repo="$1"
+  local tmp
+  tmp="$(mktemp_gutt)"
+  {
+    printf '%s\n' "Emergency notes (read-only)"
+    printf '%s\n' ""
+    printf '%s\n' "Last 20 commits:"
+    printf '%s\n' ""
+    (cd "$repo" && git --no-pager log -20 --oneline --decorate 2>/dev/null) || true
+    printf '%s\n' ""
+    printf '%s\n' "Safe options (human steps):"
+    printf '%s\n' "- If a bad commit is already shared/pushed: prefer 'git revert <hash>' (creates a new commit)."
+    printf '%s\n' "- If you just need to inspect history: use 'git reflog' to find previous states."
+    printf '%s\n' "- Avoid 'reset --hard' unless you *really* know what you’re doing (destructive)."
+    printf '%s\n' ""
+    printf '%s\n' "Tip: Phase 9.3 also offers a guided known-good tag checkout path."
+  } >"$tmp"
+  textbox "$tmp"
+  rm -f "$tmp"
+}
+
+vnext_go_to_known_good_tag() {
+  local repo="$1"
+  local tags
+  tags="$(cd "$repo" && git tag --list 'gutt/known-good-*' --sort=-creatordate 2>/dev/null || true)"
+
+  if [[ -z "$tags" ]]; then
+    msgbox "Known-good recovery" "No known-good tags found.
+
+Expected pattern: gutt/known-good-*"
+    return 0
+  fi
+
+  local menu_args=()
+  local tag commit date subj
+  while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    commit="$(cd "$repo" && git rev-parse "$tag" 2>/dev/null || true)"
+    date="$(cd "$repo" && git show -s --format='%cs' "$tag" 2>/dev/null | cut -d' ' -f1 || true)"
+    subj="$(cd "$repo" && git show -s --format='%s' "$tag" 2>/dev/null || true)"
+    menu_args+=( "$tag" "${commit:0:8} $date $subj" )
+  done <<<"$tags"
+
+  local picked
+  picked="$(menu "Pick known-good tag" "Select a known-good tag to check out (detached HEAD).
+
+This does not delete anything. You can always return to your previous branch." "${menu_args[@]}")" || return 0
+
+  local prev_branch
+  prev_branch="$(cd "$repo" && git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [[ -z "$prev_branch" ]] && prev_branch="(detached)"
+
+  local dirty
+  dirty="$(cd "$repo" && git status --porcelain 2>/dev/null || true)"
+  if [[ -n "$dirty" ]]; then
+    if whiptail --title "$APP_NAME $VERSION" --yesno --defaultno \
+      "Working tree has uncommitted changes.
+
+Stash them (stash push) and continue to the known-good tag checkout?" 12 78 3>&1 1>&2 2>&3; then
+      run_git_capture "$repo" git stash push -u -m "gutt: auto-stash before known-good checkout"
+    else
+      msgbox "Aborted" "No changes made."
+      return 0
+    fi
+  fi
+
+  run_git_capture "$repo" git checkout --detach "$picked"
+
+  msgbox "Now at known-good tag" "Checked out:
+$picked
+
+Previous branch:
+$prev_branch
+
+You are now in a detached HEAD state.
+
+To get back later:
+- git checkout $prev_branch
+- or: git checkout -"
+
+  if whiptail --title "$APP_NAME $VERSION" --yesno --defaultno \
+    "Optional (recommended):
+
+Create a new branch from this known-good state and switch to it?" 12 78 3>&1 1>&2 2>&3; then
+    local new_branch rc
+    set +e
+    new_branch="$(inputbox "Enter new branch name" "recovery/${picked//\//-}")"
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]] && return 0
+    [[ -z "$new_branch" ]] && return 0
+    run_git_capture "$repo" git checkout -b "$new_branch"
+    msgbox "Recovery branch created" "Now on branch:
+$new_branch"
+  fi
+}
+
+vnext_recover_by_branching() {
+  local repo="$1"
+  local tags
+  tags="$(cd "$repo" && git tag --list 'gutt/known-good-*' --sort=-creatordate 2>/dev/null || true)"
+
+  if [[ -z "$tags" ]]; then
+    msgbox "Recover by branching" "No known-good tags found.
+
+Expected pattern: gutt/known-good-*"
+    return 0
+  fi
+
+  local menu_args=()
+  local tag commit date subj
+  while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    commit="$(cd "$repo" && git rev-parse "$tag" 2>/dev/null || true)"
+    date="$(cd "$repo" && git show -s --format='%cs' "$tag" 2>/dev/null | cut -d' ' -f1 || true)"
+    subj="$(cd "$repo" && git show -s --format='%s' "$tag" 2>/dev/null || true)"
+    menu_args+=( "$tag" "${commit:0:8} $date $subj" )
+  done <<<"$tags"
+
+  local picked
+  picked="$(menu "Pick known-good tag" "Select a known-good tag to branch from.
+
+This creates a NEW branch and switches to it." "${menu_args[@]}")" || return 0
+
+  local dirty
+  dirty="$(cd "$repo" && git status --porcelain 2>/dev/null || true)"
+  if [[ -n "$dirty" ]]; then
+    if whiptail --title "$APP_NAME $VERSION" --yesno --defaultno \
+      "Working tree has uncommitted changes.
+
+Stash them (stash push) and continue to create a recovery branch?" 12 78 3>&1 1>&2 2>&3; then
+      run_git_capture "$repo" git stash push -u -m "gutt: auto-stash before recovery branch"
+    else
+      msgbox "Aborted" "No changes made."
+      return 0
+    fi
+  fi
+
+  local new_branch rc
+  set +e
+  new_branch="$(inputbox "Enter new branch name" "recovery/${picked//\//-}")"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] && return 0
+  [[ -z "$new_branch" ]] && return 0
+
+  if ! whiptail --title "$APP_NAME $VERSION" --yesno --defaultno \
+    "Create and switch to this branch?
+
+Branch: $new_branch
+From tag: $picked" 12 78 3>&1 1>&2 2>&3; then
+    msgbox "Aborted" "No changes made."
+    return 0
+  fi
+
+  run_git_capture "$repo" git checkout -b "$new_branch" "$picked"
+  msgbox "Recovery branch ready" "Now on branch:
+$new_branch
+
+Based on:
+$picked"
 }
 
 vnext_recovery_danger_menu() {
   local repo="$1"
-  # Reuse existing danger menu
-  action_danger_menu "$repo"
+
+  # Phase 9.1 scaffold: Recovery helpers live here, with the existing Danger Zone kept intact.
+  # No behaviour changes unless the user explicitly chooses a new Recovery placeholder item.
+  while true; do
+    local choice
+    choice="$(menu "Recovery & Dangerous" "Recovery helpers
+
+Choose an action" \
+      "KGTAGS" "Show known-good tags" \
+      "CHECK"  "Show recovery checklist" \
+      "GOKG"   "Go to known-good tag (guided)" \
+      "BRKG"   "Recover by branching (shortcut)" \
+      "EMERG"  "Emergency: last 20 commits + safe revert tips" \
+      "DANG"   "Danger Zone (existing menu)" \
+      "BACK"   "Back")" || return 0
+
+    case "$choice" in
+      KGTAGS)
+        vnext_show_known_good_tags "$repo"
+        ;;
+      GOKG)
+        vnext_go_to_known_good_tag "$repo"
+        ;;
+      BRKG)
+        vnext_recover_by_branching "$repo"
+        ;;
+      CHECK)
+        vnext_show_recovery_checklist "$repo"
+        ;;
+      EMERG)
+        vnext_show_emergency_revert_notes "$repo"
+        ;;
+      DANG)
+        action_danger_menu "$repo"
+        ;;
+      BACK)
+        return 0
+        ;;
+    esac
+  done
 }
 
 vnext_help_settings_menu() {
@@ -3650,24 +5913,24 @@ vnext_main_menu() {
       "SYNC" "Sync (Pull/Push/Fetch)" \
       "MERG" "Merge & Rebase" \
       "STSH" "Stash" \
-      "TAGS" "Tags & Releases (scaffold)" \
+      "TAGS" "Tags & Known-Good (scaffold)" \
       "HYG"  "Hygiene & Cleanup" \
       "DANG" "Recovery & Dangerous" \
       "SET"  "Settings / Help / About" \
       "BACK" "Back to classic menu")" || return 0
 
     case "$choice" in
-      FAST) vnext_common_menu "$repo" ;;
-      INFO) vnext_status_info_menu "$repo" ;;
-      BRAN) vnext_branch_menu "$repo" ;;
-      COMM) vnext_commit_menu "$repo" ;;
-      SYNC) vnext_sync_menu "$repo" ;;
-      MERG) vnext_merge_rebase_menu "$repo" ;;
-      STSH) vnext_stash_menu "$repo" ;;
-      TAGS) vnext_tags_menu "$repo" ;;
-      HYG)  vnext_hygiene_menu "$repo" ;;
-      DANG) vnext_recovery_danger_menu "$repo" ;;
-      SET)  vnext_help_settings_menu "$repo" ;;
+      FAST) gutt_run_action vnext_common_menu "$repo" ;;
+      INFO) gutt_run_action vnext_status_info_menu "$repo" ;;
+      BRAN) gutt_run_action vnext_branch_menu "$repo" ;;
+      COMM) gutt_run_action vnext_commit_menu "$repo" ;;
+      SYNC) gutt_run_action vnext_sync_menu "$repo" ;;
+      MERG) gutt_run_action vnext_merge_rebase_menu "$repo" ;;
+      STSH) gutt_run_action vnext_stash_menu "$repo" ;;
+      TAGS) gutt_run_action vnext_tags_menu "$repo" ;;
+      HYG) gutt_run_action vnext_hygiene_menu "$repo" ;;
+      DANG) gutt_run_action vnext_recovery_danger_menu "$repo" ;;
+      SET) gutt_run_action vnext_help_settings_menu "$repo" ;;
       BACK) return 0 ;;
     esac
   done
@@ -3693,27 +5956,29 @@ main_menu() {
       "UPST" "Set upstream" \
       "VNX"  "vNext menu (new structure)" \
       "DANG" "Danger zone" \
+      "PATH" "Manage PATH integration (gutt shortcut)" \
       "SETT" "Settings" \
       "SWCH" "Switch repo" \
       "QUIT" "Exit")" || return 0
 
     case "$choice" in
-      DASH) show_dashboard "$repo" ;;
-      VNX)  vnext_main_menu "$repo" ;;
-      STAT) action_status "$repo" ;;
-      STAG) action_stage_menu "$repo" ;;
-      COMM) action_commit_menu "$repo" ;;
-      STSH) action_stash_menu "$repo" ;;
-      BRAN) action_branch_menu "$repo" ;;
-      MERG) action_merge_menu "$repo" ;;
-      REM)  action_remote_menu "$repo" ;;
-      LOG)  action_log_menu "$repo" ;;
-      HYG)  action_hygiene_menu "$repo" ;;
-      PULL) action_pull_safe_update "$repo" ;;
-      PUSH) vnext_push_menu "$repo" ;;
-      UPST) action_set_upstream "$repo" ;;
-      DANG) action_danger_menu "$repo" ;;
-      SETT) action_settings_menu ;;
+      DASH) gutt_run_action show_dashboard "$repo" ;;
+      VNX) gutt_run_action vnext_main_menu "$repo" ;;
+      STAT) gutt_run_action action_status "$repo" ;;
+      STAG) gutt_run_action action_stage_menu "$repo" ;;
+      COMM) gutt_run_action action_commit_menu "$repo" ;;
+      STSH) gutt_run_action action_stash_menu "$repo" ;;
+      BRAN) gutt_run_action action_branch_menu "$repo" ;;
+      MERG) gutt_run_action action_merge_menu "$repo" ;;
+      REM) gutt_run_action action_remote_menu "$repo" ;;
+      LOG) gutt_run_action action_log_menu "$repo" ;;
+      HYG) gutt_run_action action_hygiene_menu "$repo" ;;
+      PULL) gutt_run_action action_pull_safe_update "$repo" ;;
+      PUSH) gutt_run_action vnext_push_menu "$repo" ;;
+      UPST) gutt_run_action action_set_upstream "$repo" ;;
+      DANG) gutt_run_action action_danger_menu "$repo" ;;
+      PATH) gutt_run_action gutt_manage_path_menu ;;
+      SETT) gutt_run_action action_settings_menu ;;
       SWCH)
         local newrepo
         newrepo="$(select_repo)" || continue
@@ -3724,18 +5989,272 @@ main_menu() {
   done
 }
 
+# -------------------------
+# Beginner / Advanced mode scaffold (UX.1)
+#
+# IMPORTANT:
+# - Advanced mode must remain functionally identical to pre-UX GUTT.
+# - Beginner/Advanced is a UI/view layer only (menus + wrappers).
+# - No existing action functions are modified by this scaffold.
+# -------------------------
+
+
+# -------------------------
+# Beginner wrappers (UX.2 - UX.5)
+# Wrapper-only: reuse existing helpers/flows, no new Git logic.
+# -------------------------
+
+beginner_get_info() {
+  local repo="$1"
+  show_dashboard "$repo"
+}
+
+beginner_see_what_changed() {
+  local repo="$1"
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Beginner: See what changed\n\nRepo:\n$repo\n\nChoose what to view (read-only)" \
+      "QSUM" "Quick summary (status + diff --stat)" \
+      "DIFF" "Full diff (working tree vs index/HEAD)" \
+      "UPST" "Diff vs upstream (if set)" \
+      "LOGS" "Logs & diffs menu (advanced view, still read-only)" \
+      "BACK" "Back")" || return 0
+
+    case "$choice" in
+      QSUM)
+        run_git_capture "$repo" git status
+        run_git_capture "$repo" git diff --stat
+        ;;
+      DIFF)
+        run_git_capture "$repo" git diff
+        ;;
+      UPST)
+        action_diff_upstream "$repo"
+        ;;
+      LOGS)
+        action_log_menu "$repo"
+        ;;
+      BACK) return 0 ;;
+    esac
+  done
+}
+
+beginner_save_checkpoint() {
+  local repo="$1"
+  msgbox "Beginner: Save a checkpoint" "This creates a local commit (a safe checkpoint).\n\nIt does not push anything online and it does not change your working files.\n\nAll confirmations default to NO."
+  vnext_mark_known_good "$repo"
+}
+
+beginner_upload_changes() {
+  local repo="$1"
+  msgbox "Beginner: Upload my changes" "We'll check what will be pushed, show you a clear summary, then (only if you confirm) push to your remote.\n\nNothing is uploaded unless you confirm.\n\nAll confirmations default to NO."
+  action_push "$repo"
+}
+
+beginner_download_updates() {
+  local repo="$1"
+  msgbox "Beginner: Download updates" "We'll fetch and pull updates safely, and we'll show you what's going to change before anything is applied.\n\nNothing is changed unless you confirm.\n\nAll confirmations default to NO."
+  action_pull "$repo"
+}
+
+beginner_start_new_work() {
+  local repo="$1"
+  msgbox "Beginner: Start a new piece of work" "We'll help you create a new feature branch so you can work safely without touching main.\n\nNothing is changed unless you confirm.\n\nAll confirmations default to NO."
+  vnext_create_feature_branch "$repo"
+}
+
+beginner_publish_cleanly_to_main() {
+  local repo="$1"
+  msgbox "Beginner: Publish cleanly to main" "This is a guided, safe path to get your work onto main (typically via squash merge) with checks along the way.\n\nNothing is changed unless you confirm.\n\nAll confirmations default to NO."
+  vnext_squash_merge_into_main "$repo"
+}
+
+beginner_tidy_menu() {
+  local repo="$1"
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Beginner: Tidy up files safely\n\nRepo:\n$repo\n\nSafe helpers only.\n\nNothing destructive is done from here." \
+      "SCAN" "Show hygiene report" \
+      "PREV" "Preview what 'git clean' would remove (dry-run)" \
+      "IGN"  "Suggest/append .gitignore entries (guarded)" \
+      "BACK" "Back")" || return 0
+
+    case "$choice" in
+      SCAN)
+        hygiene_scan "$repo"
+        ;;
+      PREV)
+        msgbox "Dry-run only" "Next, we'll show a DRY-RUN preview.\n\nThis does not delete anything."
+        run_git_capture "$repo" git clean -ndx
+        ;;
+      IGN)
+        # This routes to existing helper. It may offer to append; user must confirm (default NO).
+        gitignore_suggest "$repo"
+        ;;
+      BACK) return 0 ;;
+    esac
+  done
+}
+
+beginner_safety_menu() {
+  local repo="$1"
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Beginner: Get back to safety\n\nRepo:\n$repo\n\nRecovery helpers (guarded).\n\nNo 'Danger Zone' here." \
+      "CHECK" "Show recovery checklist" \
+      "KGTAGS" "Show known-good tags" \
+      "GOKG"   "Go to known-good tag (guided)" \
+      "BRKG"   "Recover by branching (shortcut)" \
+      "EMERG"  "Emergency: last 20 commits + safe revert tips" \
+      "BACK"   "Back")" || return 0
+
+    case "$choice" in
+      CHECK) gutt_run_action vnext_show_recovery_checklist "$repo" ;;
+      KGTAGS) gutt_run_action vnext_show_known_good_tags "$repo" ;;
+      GOKG) gutt_run_action vnext_go_to_known_good_tag "$repo" ;;
+      BRKG) gutt_run_action vnext_recover_by_branching "$repo" ;;
+      EMERG) gutt_run_action vnext_show_emergency_revert_notes "$repo" ;;
+      BACK) return 0 ;;
+    esac
+  done
+}
+
+beginner_main_menu() {
+  local repo="$1"
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Beginner mode (Guided)\n\nRepo:\n$repo\n\nChoose an action" \
+      "INFO" "Get info on the repo" \
+      "CHNG" "See what changed" \
+      "SAVE" "Save a checkpoint" \
+      "UPLD" "Upload my changes to my repo" \
+      "DOWN" "Download updates from my repo" \
+      "WORK" "Start a new piece of work" \
+      "PUBL" "Publish cleanly to main" \
+      "TIDY" "Tidy up files safely" \
+      "SAFE" "Help, I want to get back to safety" \
+      "MORE" "More options (Advanced)" \
+      "BACK" "Back")" || return 0
+
+    case "$choice" in
+      INFO) gutt_run_action beginner_get_info "$repo" ;;
+      CHNG) gutt_run_action beginner_see_what_changed "$repo" ;;
+      SAVE) gutt_run_action beginner_save_checkpoint "$repo" ;;
+      UPLD) gutt_run_action beginner_upload_changes "$repo" ;;
+      DOWN) gutt_run_action beginner_download_updates "$repo" ;;
+      WORK) gutt_run_action beginner_start_new_work "$repo" ;;
+      PUBL) gutt_run_action beginner_publish_cleanly_to_main "$repo" ;;
+      TIDY) gutt_run_action beginner_tidy_menu "$repo" ;;
+      SAFE) gutt_run_action beginner_safety_menu "$repo" ;;
+      MORE) return 2 ;;  # signal: jump into Advanced
+      BACK) return 0 ;;
+    esac
+  done
+}
+
+mode_selector_menu() {
+  local repo="$1"
+  while true; do
+    local choice
+    choice="$(menu "$APP_NAME $VERSION" "Choose mode\n\nRepo:\n$repo" \
+      "BEG" "Beginner (Guided)" \
+      "ADV" "Advanced (Full / Unchanged)" \
+      "QUIT" "Exit")" || return 0
+
+    case "$choice" in
+      BEG)
+        # beginner_main_menu may return 2 as a *signal* to jump into Advanced.
+        # Guard non-zero returns under set -e so Cancel/Esc or the signal code
+        # never hard-exits the script.
+        local rc=0
+        set +e
+        beginner_main_menu "$repo"
+        rc=$?
+        set -e
+
+        if [[ $rc -eq 2 ]]; then
+          main_menu "$repo"
+        elif [[ $rc -ne 0 ]]; then
+          return 0
+        fi
+        ;;
+      ADV) gutt_run_action main_menu "$repo" ;;
+      QUIT) return 0 ;;
+    esac
+  done
+}
+
+startup_repo_menu() {
+  # Repo-first startup phase.
+  # Repo-dependent modes must not be entered until a repo is explicitly confirmed.
+  # PATH management remains available without selecting a repo.
+  local detected_repo="${1:-}"
+
+  while true; do
+    local state label
+    state="$(gutt_path_integration_state)"
+    label="$(gutt_path_integration_label "$state")"
+
+    local prompt
+    if [[ -n "$detected_repo" ]]; then
+      prompt="Detected Git repo:\n\n$detected_repo\n\nChoose an action"
+    else
+      prompt="Not currently inside a Git repo.\n\nChoose an action"
+    fi
+
+    local choice
+    if [[ -n "$detected_repo" ]]; then
+      choice="$(menu "$APP_NAME $VERSION" "$prompt" \
+        "USE" "Use detected repo" \
+        "REPO" "Select a different repo directory" \
+        "PATH" "$label" \
+        "QUIT" "Exit")" || return 1
+    else
+      choice="$(menu "$APP_NAME $VERSION" "$prompt" \
+        "REPO" "Select a repo directory" \
+        "PATH" "$label" \
+        "QUIT" "Exit")" || return 1
+    fi
+
+    case "$choice" in
+      USE)
+        repos_bump_recent "$detected_repo"
+        printf '%s\n' "$detected_repo"
+        return 0
+        ;;
+      REPO)
+        local repo=""
+        repo="$(select_repo)" || continue
+        printf '%s\n' "$repo"
+        return 0
+        ;;
+      PATH)
+        gutt_manage_path_menu
+        ;;
+      QUIT)
+        return 1
+        ;;
+    esac
+  done
+}
+
 main() {
   preflight
 
-  local repo=""
-  repo="$(git_repo_root "$PWD")"
-  if [[ -z "$repo" ]]; then
-    repo="$(select_repo)" || exit 0
-  else
-    repos_bump_recent "$repo"
+  local detected repo rc
+  detected="$(git_repo_root "$PWD")"
+
+  set +e
+  repo="$(startup_repo_menu "$detected")"
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 || -z "$repo" ]]; then
+    return 0
   fi
 
-  main_menu "$repo"
+  mode_selector_menu "$repo"
 }
 
 main "$@"
+
