@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# gutt - loader/router (7-file refactor scaffolded from gutt.sh)
+
+set -Eeuo pipefail
+
+# Resolve this script dir (works even when invoked via symlink)
+__GUTT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Load order contract (no other file should source another)
+# shellcheck source=/dev/null
+source "${__GUTT_DIR}/lib_core.sh"
+# shellcheck source=/dev/null
+source "${__GUTT_DIR}/lib_ui.sh"
+# shellcheck source=/dev/null
+source "${__GUTT_DIR}/lib_git.sh"
+# shellcheck source=/dev/null
+source "${__GUTT_DIR}/lib_actions.sh"
+# shellcheck source=/dev/null
+source "${__GUTT_DIR}/tools_path.sh"
+# shellcheck source=/dev/null
+source "${__GUTT_DIR}/ui_menus.sh"
+
+main "$@"

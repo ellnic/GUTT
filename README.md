@@ -4,7 +4,7 @@
 
 **Status:** 🚧 **WIP / Alpha**
 
-GUTT wraps the common 90% of Git usage in a protective, terminal-based interface with strong safeguards against destructive mistakes.
+GUTT wraps the common 90% of Git usage in a protective, terminal based interface with strong safeguards against destructive mistakes.
 
 ---
 
@@ -12,40 +12,74 @@ GUTT wraps the common 90% of Git usage in a protective, terminal-based interface
 
 - Repository picker with memory (recent and last used)
 - Status dashboard (branch, upstream, ahead or behind, staged and untracked)
-- Stage, unstage, and discard helpers
-- Commit helpers (amend, reword, undo last commit)
-- Branch management (guarded)
-- Remote and upstream helpers
-- Logs and diffs
-- Hygiene assistant (.gitignore suggestions)
-- **Danger zone**: reset, clean, reflog, force-push with lease, tidy-history baseline (all guarded)
+- Plain English workflows for common Git tasks
+- Beginner and Advanced modes sharing the same underlying logic
+- Guarded save, undo, tidy, and recovery helpers
+- Optional safety checkpoints before risky operations
+- Centralised plan screens that explain impact before changes happen
 
 ---
 
-## Current development status
+## Modes
 
-GUTT is undergoing a structured internal refactor focused on safety, clarity, and long-term maintainability.
+### Beginner Mode
+Beginner mode avoids Git specific terminology and presents actions in plain English.  
+Examples include saving work, undoing a mistake, sending work online, and cleaning up history.
+
+Beginner mode rules:
+- No Git jargon in menus or prompts
+- All risky actions require an explanation screen first
+- Default answer is always No
+- Typed confirmation is required for irreversible actions
+
+### Advanced Mode
+Advanced mode exposes more traditional Git wording and workflows but still routes all actions through the same safety layers.
+
+Advanced mode never bypasses safeguards.
 
 ---
 
 ## Safety principles
 
 - Refuses to run as root
-- Refuses destructive actions on dirty repositories
-- Dry-runs before deletes
-- Typed confirmation phrases for history rewrites and force-push
-- Defaults to no for all destructive prompts
-- Optional local safety tags before dangerous operations
+- Defaults to No for all risky confirmations
+- Cancel or Esc never exits the entire application
+- Typed confirmation for history rewrites and force updates
+- Optional local checkpoints before destructive actions
+- Clear plan screens before AMBER and RED risk actions
 
-GUTT does not try to make Git safe. It makes intent explicit and mistakes harder. *You can still destroy your repos if you do not know what you are doing.*
+GUTT does not try to make Git safe. It makes intent explicit and mistakes harder.  
+You can still damage a repository if you ignore warnings.
 
 ---
 
-## Why?
+## Internal structure (7 file layout)
 
-- It is for git, not hosting platforms
-- Web UIs and vendor tooling often get in the way
-- Why not?
+GUTT is structured into seven clearly defined files to reduce risk and keep responsibilities isolated.
+
+1. `gutt`  
+   Loader and router. Sources files in a fixed order and shows the top level menu.
+
+2. `lib_core.sh`  
+   Core helpers, logging, repo detection, and state gathering. No UI logic.
+
+3. `lib_ui.sh`  
+   All dialog and whiptail wrappers. Handles Cancel and default No behaviour.
+
+4. `lib_git.sh`  
+   Pure Git primitives. No UI. Returns exit codes and output only.
+
+5. `lib_actions.sh`  
+   Shared action layer. Maps actions to risk levels and builds plan data.
+
+6. `ui_menus.sh`  
+   Beginner and Advanced menus. Presentation only. Calls action functions.
+
+7. `tools_path.sh`  
+   PATH install, remove, and status logic using a safety focused wrapper.
+
+No file sources another file directly.  
+All sourcing is done once by `gutt` in a fixed order.
 
 ---
 
@@ -53,7 +87,7 @@ GUTT does not try to make Git safe. It makes intent explicit and mistakes harder
 
 - `git`
 - `whiptail`
-- POSIX-compatible shell environment
+- POSIX compatible shell environment
 
 ---
 
@@ -76,17 +110,9 @@ Stored per user:
 
 ---
 
-## Project Status and Disclaimer ⚠️
+## Project status and disclaimer ⚠️
 
-**GUTT IS CURRENTLY IN ACTIVE DEVELOPMENT AND SHOULD BE CONSIDERED ALPHA SOFTWARE. GUTT MAY CONTAIN BUGS THAT COULD LEAD TO REPOSITORY DAMAGE OR DATA LOSS. YOU SHOULD REVIEW THE CODE YOURSELF BEFORE RUNNING IT. THIS TOOL IS PROVIDED WITH ABSOLUTELY NO WARRANTY, EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE. YOU USE THIS TOOL ENTIRELY AT YOUR OWN RISK. THE SCRIPT IS PROVIDED "AS IS" AND IN GOOD FAITH WITH THE INTENT OF ASSISTING SAFE, INTENTIONAL GIT USAGE.**
-
----
-
-## Transparency note 🤖
-
-Some parts of this project are developed with the assistance of AI tools.  
-All logic, safety decisions, and final changes are reviewed, tested, and curated by the project author.  
-AI assistance is used as a productivity aid, not as an autonomous decision-maker.
+**GUTT IS CURRENTLY IN ACTIVE DEVELOPMENT AND SHOULD BE CONSIDERED ALPHA SOFTWARE.  IT MAY CONTAIN BUGS THAT COULD LEAD TO REPOSITORY DAMAGE OR DATA LOSS. YOU SHOULD REVIEW THE CODE BEFORE USE. THIS SOFTWARE IS PROVIDED WITHOUT WARRANTY AND IS USED AT YOUR OWN RISK.**
 
 ---
 
