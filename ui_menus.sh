@@ -295,17 +295,13 @@ action_settings_menu() {
 
     case "$choice" in
       PULL)
-        local pm rc=0 had_e=0
-        [[ $- == *e* ]] && had_e=1
-        set +e
-        pm="$(whiptail --title "$APP_NAME $VERSION" --radiolist "Select default pull mode" 14 70 3 \
+        local pm rc=0
+        pm="$(radiolist "$APP_NAME $VERSION" "Select default pull mode" 6 \
           "ff-only" "Fast-forward only" $( [[ "$pull_mode" == "ff-only" ]] && echo ON || echo OFF ) \
           "merge" "Merge (default)" $( [[ "$pull_mode" == "merge" ]] && echo ON || echo OFF ) \
           "rebase" "Rebase" $( [[ "$pull_mode" == "rebase" ]] && echo ON || echo OFF ) \
-          3>&1 1>&2 2>&3)"
-        rc=$?
-        ((had_e)) && set -e
-        [[ $rc -eq 0 ]] || continue
+        )"
+        rc=$?; [[ $rc -eq 0 ]] || continue
         cfg_set default_pull_mode "$pm"
         ;;
       FETCH)
@@ -769,9 +765,9 @@ $label"
   rm -f "$tmp"
 
   if have_origin_remote "$repo"; then
-    if whiptail --title "$APP_NAME $VERSION" --yesno --defaultno       "Upload this bookmark to the online copy now?
+    if yesno "Upload this bookmark to the online copy now?
 
-Bookmark: $label" 12 78 3>&1 1>&2 2>&3; then
+Bookmark: $label"; then
       run_git_capture "$repo" git push origin "$label"
     fi
   else
@@ -800,13 +796,13 @@ Switch to a work line first, then try again."
   upstream="$(git_upstream "$repo")"
 
   if [[ -n "$upstream" ]]; then
-    if ! whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "Upload your work now?
+    if ! yesno "Upload your work now?
 
 Work line: $workline
 
 An online destination is already linked for this work line.
 
-Nothing is uploaded unless you choose YES." 14 78 3>&1 1>&2 2>&3; then
+Nothing is uploaded unless you choose YES."; then
       msgbox "Cancelled."
       return 0
     fi
@@ -825,13 +821,13 @@ Set up an online copy first, then try again."
       return 1
     fi
 
-    if ! whiptail --title "$APP_NAME $VERSION" --defaultno --yesno "This work line is not linked to an online target yet.
+    if ! yesno "This work line is not linked to an online target yet.
 
 Work line: $workline
 
 We can link this work line to the default online destination, then upload.
 
-Nothing is uploaded unless you choose YES." 18 78 3>&1 1>&2 2>&3; then
+Nothing is uploaded unless you choose YES."; then
       msgbox "Cancelled."
       return 0
     fi

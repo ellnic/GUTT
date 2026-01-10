@@ -209,3 +209,17 @@ refuse_if_dirty() {
   fi
   return 0
 }
+
+git_is_repo() {
+  local repo="$1"
+
+  # basic sanity
+  [[ -n "${repo:-}" && -d "$repo/.git" ]] || return 1
+
+  # authoritative git check
+  (
+    cd "$repo" 2>/dev/null &&
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1
+  )
+}
+

@@ -1,857 +1,336 @@
 #!/usr/bin/env bash
-# tools_path.sh - PATH integration (wrapper-based install/remove/status)
+# tools_path.sh - PATH integration (explicit, symlink-based, non-invasive)
+#
+# Definition of "PATH integration":
+#   Create a single executable entry called 'gutt' discoverable via:
+#     command -v gutt
+#
+# This is implemented ONLY as a symlink pointing at this repo's canonical entrypoint.
+# No shell rc-file editing. No PATH exports. No silent exits.
 
-gutt_self_realpath() {
-  readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s
-' "${BASH_SOURCE[0]}"
+# Canonical entrypoint (single source of truth)
+# Locked to: <repo_root>/gutt (the main router script).
+
+_gutt_entry_realpath() {
+  local entry="${__GUTT_DIR:-}"/gutt
+  if [[ -z "${__GUTT_DIR:-}" || ! -e "$entry" ]]; then
+    # Fallback: resolve from this file's dir (should not happen in normal runs)
+    entry="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/gutt"
+  fi
+  readlink -f -- "$entry" 2>/dev/null || printf '%s\n' "$entry"
 }
 
-gutt_path_integration_state() {
-  # PATH-authoritative semantic state for the *current shell*.
-  #
-  # States:
-  # - INSTALLED   : gutt resolves on PATH and is managed by this GUTT
-  # - FOREIGN     : gutt resolves on PATH but is not managed by this GUTT
-  # - PARTIAL     : a wrapper exists in a common install location, but PATH cannot resolve gutt
-  # - UNINSTALLED : no wrapper and no gutt on PATH
-  local cv="" tt="" p="" ours="0"
+# Back-compat: other parts of GUTT call this name.
+gutt_self_realpath() { _gutt_entry_realpath; }
 
-  cv="$(command -v gutt 2>/dev/null || true)"
-  tt="$(type -t gutt 2>/dev/null || true)"
+_gutt_install_locations() {
+  # Order matters (preferred first)
+  printf '%s\n' \
+    "/usr/local/bin/gutt" \
+    "$HOME/.local/bin/gutt"
+}
 
-  if [[ -n "$cv" ]]; then
-    # If gutt is an alias/function/builtin, it's callable but not a wrapper we can own/manage.
-    if [[ "$tt" != "file" && "$tt" != "keyword" ]]; then
-      echo "FOREIGN"
+_gutt_first_writable_target() {
+  local t dir
+  while IFS= read -r t; do
+    dir="$(dirname -- "$t")"
+    if [[ -d "$dir" && -w "$dir" ]]; then
+      printf '%s\n' "$t"
       return 0
     fi
+  done < <(_gutt_install_locations)
 
-    p="$cv"
-
-    # Determine whether this PATH-resolved gutt is ours.
-    if [[ -n "$p" && -f "$p" ]]; then
-      # Marker makes "ours" detection robust even if entry target has moved.
-      if grep -qE '^[[:space:]]*# GUTT_WRAPPER[[:space:]]*$' "$p" 2>/dev/null; then
-        ours="1"
-      else
-        # Legacy wrapper support (pre-marker installs)
-        case "$p" in
-          "$HOME/.local/bin/gutt" | "$HOME/bin/gutt")
-            if grep -qE '^[[:space:]]*GUTT_ENTRY=' "$p" 2>/dev/null; then
-              ours="1"
-            elif grep -qF "gutt.sh" "$p" 2>/dev/null; then
-              ours="1"
-            fi
-            ;;
-        esac
-      fi
-
-      # If wrapper exposes a target, also compare it to our current entry path.
-      if [[ "$ours" != "1" ]]; then
-        local _t="" rp="" self=""
-        _t="$(grep -E '^[[:space:]]*GUTT_ENTRY=' "$p" 2>/dev/null | head -n 1 | sed -E 's/^[[:space:]]*GUTT_ENTRY=//')"
-        _t="${_t%\"}"; _t="${_t#\"}"
-        _t="${_t%\'}"; _t="${_t#\'}"
-        if [[ -n "$_t" ]]; then
-          rp="$(readlink -f -- "$_t" 2>/dev/null || printf '%s' "$_t")"
-          self="$(gutt_self_realpath 2>/dev/null || true)"
-          if [[ -n "$rp" && -n "$self" && "$rp" == "$self" ]]; then
-            ours="1"
-          fi
-        fi
-      fi
-    fi
-
-    if [[ "$ours" == "1" ]]; then
-      echo "INSTALLED"
-    else
-      echo "FOREIGN"
-    fi
+  # User dir may not exist yet.
+  if [[ -d "$HOME/.local" && ( ! -d "$HOME/.local/bin" ) && -w "$HOME/.local" ]]; then
+    printf '%s\n' "$HOME/.local/bin/gutt"
     return 0
   fi
 
-  # Not callable via PATH in this shell. Look for a disk-only wrapper (partial install).
-  if [[ -x "$HOME/.local/bin/gutt" || -x "$HOME/bin/gutt" ]]; then
-    echo "PARTIAL"
-  else
-    echo "UNINSTALLED"
-  fi
-}
-
-gutt_path_integration_label() {
-  local st="${1:-}"
-  if [[ -z "$st" ]]; then
-    st="$(gutt_path_integration_state)"
-  fi
-  case "$st" in
-    INSTALLED) gutt_run_action echo "PATH Integration: INSTALLED (this GUTT)" ;;
-    PARTIAL) gutt_run_action echo "PATH Integration: PARTIAL (wrapper present, not on PATH)" ;;
-    FOREIGN) gutt_run_action echo "PATH Integration: FOREIGN (another gutt on PATH)" ;;
-    UNINSTALLED) gutt_run_action echo "PATH Integration: UNINSTALLED" ;;
-    *)           echo "PATH Integration: UNINSTALLED" ;;
-  esac
-}
-
-gutt_path_rc_file_for_shell() {
-  # Echo the preferred rc file for the detected shell.
-  local sh
-  sh="$(gutt_detect_user_shell)"
-  case "$sh" in
-    zsh)
-      printf '%s\n' "$HOME/.zshrc"
-      ;;
-    bash|*)
-      if [[ -f "$HOME/.bashrc" ]]; then
-        printf '%s\n' "$HOME/.bashrc"
-      else
-        printf '%s\n' "$HOME/.profile"
-      fi
-      ;;
-  esac
-}
-
-gutt_path_managed_block_present() {
-  local rcfile="$1"
-  [[ -n "$rcfile" ]] || return 1
-  grep -Fq "# >>> GUTT PATH >>>" "$rcfile" 2>/dev/null && return 0
-  grep -Fq "# <<< GUTT PATH <<<" "$rcfile" 2>/dev/null && return 0
   return 1
 }
 
-gutt_path_managed_block_health() {
-  # Echo: OK | NONE | MULTIPLE | MALFORMED
-  local rcfile="$1"
-  [[ -n "$rcfile" ]] || { echo "NONE"; return 0; }
+_gutt_is_symlink_to_entry() {
+  # Usage: _gutt_is_symlink_to_entry <path> <entry_real>
+  local p="${1:-}" entry_real="${2:-}"
+  [[ -n "$p" && -n "$entry_real" ]] || return 1
+  [[ -L "$p" ]] || return 1
 
-  local start_count end_count
-  start_count="$(grep -Fxc "# >>> GUTT PATH >>>" "$rcfile" 2>/dev/null || echo 0)"
-  end_count="$(grep -Fxc "# <<< GUTT PATH <<<" "$rcfile" 2>/dev/null || echo 0)"
+  local rp
+  rp="$(readlink -f -- "$p" 2>/dev/null || true)"
+  [[ -n "$rp" && "$rp" == "$entry_real" ]]
+}
 
-  if [[ "${start_count:-0}" -eq 0 && "${end_count:-0}" -eq 0 ]]; then
-    echo "NONE"
-    return 0
-  fi
+_gutt_path_status_compute() {
+  # Emits:
+  #   cmd_path|notfound
+  #   cmd_type
+  #   cmd_is_symlink(0/1)
+  #   cmd_target (resolved) or blank
+  #   summary (Installed and valid / Installed but stale / Installed but foreign / Not installed)
+  local entry_real cmd_path cmd_type cmd_is_symlink cmd_target summary
 
-  if [[ "${start_count:-0}" -eq 1 && "${end_count:-0}" -eq 1 ]]; then
-    local sline eline
-    sline="$(grep -Fn "# >>> GUTT PATH >>>" "$rcfile" 2>/dev/null | head -n 1 | cut -d: -f1)"
-    eline="$(grep -Fn "# <<< GUTT PATH <<<" "$rcfile" 2>/dev/null | head -n 1 | cut -d: -f1)"
-    if [[ -n "$sline" && -n "$eline" && "$sline" -lt "$eline" ]]; then
-      echo "OK"
-    else
-      echo "MALFORMED"
+  entry_real="$(_gutt_entry_realpath)"
+  cmd_path="$(command -v gutt 2>/dev/null || true)"
+  cmd_type="$(type -t gutt 2>/dev/null || true)"
+
+  cmd_is_symlink=0
+  cmd_target=""
+
+  if [[ -n "$cmd_path" && ( "$cmd_type" == "file" || "$cmd_type" == "keyword" ) && -e "$cmd_path" ]]; then
+    if [[ -L "$cmd_path" ]]; then
+      cmd_is_symlink=1
+      cmd_target="$(readlink -f -- "$cmd_path" 2>/dev/null || true)"
     fi
+  fi
+
+  # Decide summary
+  summary="Not installed"
+
+  if [[ -n "$cmd_path" ]]; then
+    if [[ "$cmd_type" != "file" && "$cmd_type" != "keyword" ]]; then
+      summary="Installed but foreign"
+    elif [[ "$cmd_is_symlink" -eq 1 ]]; then
+      if [[ -n "$cmd_target" && "$cmd_target" == "$entry_real" ]]; then
+        summary="Installed and valid"
+      else
+        # It's a symlink but not to this repo's current entrypoint.
+        # If it's in our install locations, call it stale, else foreign.
+        case "$cmd_path" in
+          "/usr/local/bin/gutt"|"$HOME/.local/bin/gutt") summary="Installed but stale" ;;
+          *) summary="Installed but foreign" ;;
+        esac
+      fi
+    else
+      # Resolved to a real file (or a non-symlink). That's foreign.
+      summary="Installed but foreign"
+    fi
+  else
+    # Not on PATH. If a matching symlink exists in our locations, call it stale.
+    local loc
+    while IFS= read -r loc; do
+      if _gutt_is_symlink_to_entry "$loc" "$entry_real"; then
+        summary="Installed but stale"
+        break
+      fi
+    done < <(_gutt_install_locations)
+  fi
+
+  printf '%s|%s|%s|%s|%s\n' \
+    "${cmd_path:-notfound}" \
+    "${cmd_type:-}" \
+    "${cmd_is_symlink}" \
+    "${cmd_target:-}" \
+    "${summary}"
+}
+
+# --- Public API expected by UI ---
+
+gutt_path_integration_state() {
+  # Match the POA summary states.
+  local parts summary
+  parts="$(_gutt_path_status_compute)"
+  summary="${parts##*|}"
+
+  case "$summary" in
+    "Installed and valid") echo "INSTALLED" ;;
+    "Installed but stale") echo "STALE" ;;
+    "Installed but foreign") echo "FOREIGN" ;;
+    *) echo "UNINSTALLED" ;;
+  esac
+}
+
+gutt_path_integration_label() {
+  local st
+  st="$(gutt_path_integration_state 2>/dev/null || true)"
+  case "$st" in
+    INSTALLED) echo "PATH integration: Installed and valid" ;;
+    STALE)     echo "PATH integration: Installed but stale (repo moved?)" ;;
+    FOREIGN)   echo "PATH integration: Installed but foreign" ;;
+    *)         echo "PATH integration: Not installed" ;;
+  esac
+}
+
+gutt_path_status() {
+  # If whiptail is missing/broken, print plainly to terminal.
+  if ! command -v whiptail >/dev/null 2>&1; then
+    printf '\n[PATH integration] whiptail not found. Showing status in plain text.\n\n' >/dev/tty
+    gutt_path_status_plain
+    printf '\nInstall/remove requires the TUI (whiptail).\n' >/dev/tty
     return 0
   fi
 
-  echo "MULTIPLE"
-  return 0
-}
+  local parts cmd_path cmd_type cmd_is_symlink cmd_target summary entry_real
+  entry_real="$(_gutt_entry_realpath)"
+  parts="$(_gutt_path_status_compute)"
+  IFS='|' read -r cmd_path cmd_type cmd_is_symlink cmd_target summary <<<"$parts"
 
-gutt_path_scan_unmanaged_lines() {
-  # Prints up to 40 matching lines outside the managed block:
-  # lines that reference .local/bin and PATH
-  local rcfile="$1"
-  [[ -n "$rcfile" ]] || return 0
-  awk '
-    BEGIN { in=0 }
-    /# >>> GUTT PATH >>>/ { in=1; next }
-    /# <<< GUTT PATH <<</ { in=0; next }
-    {
-      if (!in && $0 ~ /\.local\/bin/ && $0 ~ /PATH/) {
-        printf "%d:%s
-", NR, $0
-      }
-    }
-  ' "$rcfile" 2>/dev/null | head -n 40
-}
+  local msg
+  msg="Canonical entrypoint:\n  $entry_real\n\n"
+  msg+="command -v gutt:\n  ${cmd_path/notfound/not found}\n"
 
-gutt_path_show_scan_report() {
-  local sh rcfile health unmanaged
-  sh="$(gutt_detect_user_shell)"
-  rcfile="$(gutt_path_rc_file_for_shell)"
-  health="$(gutt_path_managed_block_health "$rcfile")"
-  unmanaged="$(gutt_path_scan_unmanaged_lines "$rcfile")"
+  if [[ "$cmd_path" != "notfound" ]]; then
+    msg+="type -t gutt:\n  ${cmd_type:-unknown}\n\n"
 
-  local msg=""
-  msg+="Shell: $sh
-"
-  msg+="Config file: $rcfile
-
-"
-
-  case "$health" in
-    NONE)      msg+="Managed block: not present
-" ;;
-    OK)        msg+="Managed block: present (OK)
-" ;;
-    MULTIPLE)  msg+="Managed block: ⚠ multiple marker blocks detected
-" ;;
-    MALFORMED) msg+="Managed block: ⚠ malformed markers/order detected
-" ;;
-    *)         msg+="Managed block: unknown
-" ;;
-  esac
-
-  if [[ -n "$unmanaged" ]]; then
-    msg+="
-⚠ Legacy/unmanaged PATH edits referencing .local/bin found (outside managed block):
-"
-    msg+="$unmanaged
-"
-    msg+="
-Note: GUTT will not remove unknown PATH lines automatically.
-"
-  else
-    msg+="
-No legacy/unmanaged .local/bin PATH edits detected outside the managed block.
-"
+    if [[ "$cmd_is_symlink" -eq 1 ]]; then
+      msg+="Resolved command is a symlink:\n  yes\n"
+      msg+="Symlink target (resolved):\n  ${cmd_target:-unknown}\n"
+    else
+      msg+="Resolved command is a symlink:\n  no\n"
+    fi
   fi
+
+  msg+="\nSummary:\n  $summary\n"
 
   msgbox "$msg"
   return 0
 }
 
-gutt_path_repair_managed_block() {
-  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    msgbox "Per-user install. Run GUTT as your normal user."
+gutt_path_status_plain() {
+  local parts cmd_path cmd_type cmd_is_symlink cmd_target summary entry_real
+  entry_real="$(_gutt_entry_realpath)"
+  parts="$(_gutt_path_status_compute)"
+  IFS='|' read -r cmd_path cmd_type cmd_is_symlink cmd_target summary <<<"$parts"
+
+  printf 'Canonical entrypoint: %s\n' "$entry_real" >/dev/tty
+  printf 'command -v gutt:      %s\n' "${cmd_path/notfound/not found}" >/dev/tty
+  if [[ "$cmd_path" != "notfound" ]]; then
+    printf 'type -t gutt:         %s\n' "${cmd_type:-unknown}" >/dev/tty
+    if [[ "$cmd_is_symlink" -eq 1 ]]; then
+      printf 'symlink target:       %s\n' "${cmd_target:-unknown}" >/dev/tty
+    fi
+  fi
+  printf 'summary:              %s\n' "$summary" >/dev/tty
+}
+
+gutt_path_install() {
+  local entry_real target target_dir
+  entry_real="$(_gutt_entry_realpath)"
+
+  target="$(_gutt_first_writable_target || true)"
+  if [[ -z "$target" ]]; then
+    msgbox "❌ No writable install location found.\n\nTried:\n- /usr/local/bin/gutt (needs write access)\n- $HOME/.local/bin/gutt (needs write access)\n\nGUTT will not modify PATH or shell rc files."
     return 0
   fi
 
-  # Repairs only the content between the first pair of our markers (if valid).
-  local sh rcfile health rc
-  sh="$(gutt_detect_user_shell)"
-  rcfile="$(gutt_path_rc_file_for_shell)"
-  health="$(gutt_path_managed_block_health "$rcfile")"
+  target_dir="$(dirname -- "$target")"
 
-  if [[ "$health" == "NONE" ]]; then
-    msgbox "No managed block to repair.
+  # Ensure user dir exists if chosen
+  if [[ "$target" == "$HOME/.local/bin/gutt" ]]; then
+    mkdir -p -- "$target_dir" 2>/dev/null || true
+  fi
 
-File:
-$rcfile"
+  # Preflight existing
+  if [[ -e "$target" || -L "$target" ]]; then
+    if _gutt_is_symlink_to_entry "$target" "$entry_real"; then
+      msgbox "✅ Already installed.\n\n$target -> $entry_real"
+      return 0
+    fi
+
+    local what="file"
+    [[ -L "$target" ]] && what="symlink"
+    local existing_target=""
+    if [[ -L "$target" ]]; then
+      existing_target="$(readlink -f -- "$target" 2>/dev/null || true)"
+    fi
+
+    msgbox "⚠ Refusing to overwrite existing entry.\n\nPath: $target\nType: $what\nSymlink target: ${existing_target:-n/a}\n\nWanted: symlink to\n  $entry_real"
     return 0
   fi
 
-  if [[ "$health" != "OK" ]]; then
-    msgbox "⚠ Managed block markers are not in a simple repairable state (health=$health).
-
-File:
-$rcfile
-
-GUTT will not attempt an automatic repair here. Use the scan report and fix manually if needed."
-    return 0
+  if ! yesno "🔗 Install PATH integration\n\nCreate symlink:\n  $target\n-> $entry_real\n\nProceed?"; then
+    return 2
   fi
 
-  if ! yesno "🛠 Repair managed PATH block
-
-Shell: $sh
-File: $rcfile
-
-This will ONLY replace the content between:
-  # >>> GUTT PATH >>>
-  # <<< GUTT PATH <<<
-
-with the canonical line:
-  export PATH=\"\$HOME/.local/bin:\$PATH\"
-
-Proceed?"; then
-    return 0
-  fi
-
-  local tmp
-  tmp="$(mktemp_gutt)"
-
+  local rc=0
   set +e
-  awk '
-    BEGIN { in=0; done=0 }
-    /^# >>> GUTT PATH >>>[[:space:]]*$/ {
-      print
-      if (!done) {
-        print "export PATH=\"$HOME/.local/bin:$PATH\""
-        in=1
-      }
-      next
-    }
-    /^# <<< GUTT PATH <<<[[:space:]]*$/ {
-      if (in && !done) {
-        in=0
-        done=1
-        print
-        next
-      }
-      print
-      next
-    }
-    {
-      if (in && !done) next
-      print
-    }
-  ' "$rcfile" >"$tmp" 2>/dev/null
+  ln -s -- "$entry_real" "$target" 2>/dev/null
   rc=$?
   set -e
 
   if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to build repaired file (rc=$rc).
-
-File:
-$rcfile"
+    msgbox "❌ Failed to create symlink (rc=$rc).\n\nTarget:\n  $target\n\nEntry:\n  $entry_real"
     return 0
   fi
 
-  set +e
-  mv -f -- "$tmp" "$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to write repaired file (rc=$rc).
-
-File:
-$rcfile"
-    return 0
-  fi
-
-  msgbox "✅ Repaired managed PATH block.
-
-File:
-$rcfile
-
-Open a new terminal (or source the file) and try:
-  command -v gutt
-  gutt"
+  hash -r 2>/dev/null || true
+  msgbox "✅ Installed.\n\n$target -> $entry_real\n\nCheck:\n  command -v gutt\n  gutt"
   return 0
 }
 
-gutt_path_purge_and_rebuild_managed_block() {
-  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    msgbox "Per-user install. Run GUTT as your normal user."
+gutt_path_remove() {
+  local entry_real removed_any=0
+  entry_real="$(_gutt_entry_realpath)"
+
+  local targets=()
+  while IFS= read -r t; do targets+=("$t"); done < <(_gutt_install_locations)
+
+  local matches=()
+  local t
+  for t in "${targets[@]}"; do
+    if _gutt_is_symlink_to_entry "$t" "$entry_real"; then
+      matches+=("$t")
+    fi
+  done
+
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    msgbox "Nothing to remove.\n\nNo matching symlink found in:\n- /usr/local/bin/gutt\n- $HOME/.local/bin/gutt"
     return 0
   fi
 
-  local sh rcfile health rc
-  sh="$(gutt_detect_user_shell)"
-  rcfile="$(gutt_path_rc_file_for_shell)"
-  health="$(gutt_path_managed_block_health "$rcfile")"
+  local msg="🧹 Remove PATH integration\n\nThis will remove ONLY symlinks that point to:\n  $entry_real\n\nRemove:\n"
+  for t in "${matches[@]}"; do
+    msg+="  - $t\n"
+  done
+  msg+="\nProceed?"
 
-  if [[ "$health" == "NONE" ]]; then
-    msgbox "No managed PATH block markers were found.
-
-File:
-$rcfile
-
-Nothing to purge."
-    return 0
+  if ! yesno "$msg"; then
+    return 2
   fi
 
-  if ! yesno "⚠ Recovery: purge and rebuild managed PATH block
+  local rc=0
+  for t in "${matches[@]}"; do
+    set +e
+    rm -f -- "$t" 2>/dev/null
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      removed_any=1
+    else
+      msgbox "❌ Failed to remove (rc=$rc):\n\n$t"
+      return 0
+    fi
+  done
 
-Shell: $sh
-File: $rcfile
-Health: $health
+  hash -r 2>/dev/null || true
 
-This will:
-- Make a timestamped backup of the file
-- Remove ALL GUTT managed-block marker pairs (and their contents) if present
-- Remove orphan marker lines if present
-- Append a fresh clean managed block at the end
-
-Canonical line:
-  export PATH=\"\$HOME/.local/bin:\$PATH\"
-
-Proceed?"; then
-    return 0
-  fi
-
-  # Ensure file exists
-  set +e
-  mkdir -p -- "$(dirname -- "$rcfile")" 2>/dev/null
-  touch -- "$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    msgbox "❌ Failed to prepare config file (rc=$rc).
-
-File:
-$rcfile"
-    return 0
-  fi
-
-  local ts backup tmp
-  ts="$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'backup')"
-  backup="${rcfile}.gutt.bak.${ts}"
-  tmp="$(mktemp_gutt)"
-
-  set +e
-  cp -p -- "$rcfile" "$backup" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to create backup (rc=$rc).
-
-File:
-$rcfile"
-    return 0
-  fi
-
-  # Purge logic:
-  # - If we see a start marker, buffer until we see an end marker.
-  #   If we see a matching end marker, we drop the whole buffered block.
-  #   If we reach EOF without an end marker, we emit buffered lines except marker lines.
-  # - Orphan end markers are dropped.
-  set +e
-  awk '
-    function flush_buf(    i) {
-      for (i=1; i<=bn; i++) {
-        if (buf[i] != "# >>> GUTT PATH >>>" && buf[i] != "# <<< GUTT PATH <<<") {
-          print buf[i]
-        }
-      }
-      bn=0
-    }
-    BEGIN { in=0; bn=0 }
-    $0 == "# >>> GUTT PATH >>>" {
-      in=1
-      bn=0
-      buf[++bn]=$0
-      next
-    }
-    $0 == "# <<< GUTT PATH <<<" {
-      if (in==1) {
-        # matched end, drop buffered block and this end marker
-        in=0
-        bn=0
-        next
-      }
-      # orphan end marker, drop it
-      next
-    }
-    {
-      if (in==1) {
-        buf[++bn]=$0
-        next
-      }
-      # outside managed block, also drop any stray marker lines
-      if ($0 == "# >>> GUTT PATH >>>" || $0 == "# <<< GUTT PATH <<<") next
-      print
-    }
-    END {
-      if (in==1) {
-        # no end marker, keep buffered content but remove markers
-        flush_buf()
-      }
-    }
-  ' "$rcfile" >"$tmp" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to build purged file (rc=$rc).
-
-File:
-$rcfile
-
-Backup:
-$backup"
-    return 0
-  fi
-
-  set +e
-  {
-    printf '\n# >>> GUTT PATH >>>\n'
-    printf 'export PATH="$HOME/.local/bin:$PATH"\n'
-    printf '# <<< GUTT PATH <<<\n'
-  } >>"$tmp" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to append fresh managed block (rc=$rc).
-
-File:
-$rcfile
-
-Backup:
-$backup"
-    return 0
-  fi
-
-  set +e
-  mv -f -- "$tmp" "$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to write updated file (rc=$rc).
-
-File:
-$rcfile
-
-Backup:
-$backup"
-    return 0
-  fi
-
-  msgbox "✅ Purged and rebuilt managed PATH block.
-
-File:
-$rcfile
-Backup:
-$backup
-
-Open a new terminal (or source the file) and try:
-  command -v gutt
-  gutt"
-  return 0
-}
-
-gutt_path_remove_managed_block() {
-  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    msgbox "Per-user install. Run GUTT as your normal user."
-    return 0
-  fi
-
-  local sh rcfile health rc
-  sh="$(gutt_detect_user_shell)"
-  rcfile="$(gutt_path_rc_file_for_shell)"
-  health="$(gutt_path_managed_block_health "$rcfile")"
-
-  if [[ "$health" == "NONE" ]]; then
-    msgbox "No managed PATH block markers were found.
-
-File:
-$rcfile
-
-Nothing to remove."
-    return 0
-  fi
-
-  if ! yesno "🧹 Remove managed PATH block
-
-Shell: $sh
-File: $rcfile
-Health: $health
-
-This will:
-- Make a timestamped backup of the file
-- Remove ALL marker pairs:
-    # >>> GUTT PATH >>>
-    # <<< GUTT PATH <<<
-  and anything between them
-- Remove orphan marker lines if present
-
-Note:
-- GUTT will NOT remove unknown PATH lines outside the managed block.
-- Removing the managed block may mean new terminals can no longer find:
-    gutt
-
-Proceed?"; then
-    return 0
-  fi
-
-  # Ensure file exists
-  set +e
-  mkdir -p -- "$(dirname -- "$rcfile")" 2>/dev/null
-  touch -- "$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    msgbox "❌ Failed to prepare config file (rc=$rc).
-
-File:
-$rcfile"
-    return 0
-  fi
-
-  local ts backup tmp
-  ts="$(date +%Y%m%d_%H%M%S 2>/dev/null || printf 'backup')"
-  backup="${rcfile}.gutt.bak.${ts}"
-  tmp="$(mktemp_gutt)"
-
-  set +e
-  cp -p -- "$rcfile" "$backup" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to create backup (rc=$rc).
-
-File:
-$rcfile"
-    return 0
-  fi
-
-  # Purge logic:
-  # - Drop any complete managed blocks
-  # - Drop orphan marker lines
-  # - If a start marker is seen without an end marker, keep buffered lines but remove markers
-  set +e
-  awk '
-    function flush_buf(    i) {
-      for (i=1; i<=bn; i++) {
-        if (buf[i] != "# >>> GUTT PATH >>>" && buf[i] != "# <<< GUTT PATH <<<") {
-          print buf[i]
-        }
-      }
-      bn=0
-    }
-    BEGIN { in=0; bn=0 }
-    $0 == "# >>> GUTT PATH >>>" {
-      in=1
-      bn=0
-      buf[++bn]=$0
-      next
-    }
-    $0 == "# <<< GUTT PATH <<<" {
-      if (in==1) {
-        # matched end, drop buffered block and this end marker
-        in=0
-        bn=0
-        next
-      }
-      # orphan end marker, drop it
-      next
-    }
-    {
-      if (in==1) {
-        buf[++bn]=$0
-        next
-      }
-      # outside managed block, also drop any stray marker lines
-      if ($0 == "# >>> GUTT PATH >>>" || $0 == "# <<< GUTT PATH <<<") next
-      print
-    }
-    END {
-      if (in==1) {
-        # no end marker, keep buffered content but remove markers
-        flush_buf()
-      }
-    }
-  ' "$rcfile" >"$tmp" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to build updated file (rc=$rc).
-
-File:
-$rcfile
-
-Backup:
-$backup"
-    return 0
-  fi
-
-  set +e
-  mv -f -- "$tmp" "$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    rm -f -- "$tmp" 2>/dev/null || true
-    msgbox "❌ Failed to write updated file (rc=$rc).
-
-File:
-$rcfile
-
-Backup:
-$backup"
-    return 0
-  fi
-
-  msgbox "✅ Removed managed PATH block.
-
-File:
-$rcfile
-Backup:
-$backup
-
-Open a new terminal (or source the file) if you want to re-check:
-  command -v gutt"
+  msgbox "✅ Removed.\n\nRe-check:\n  command -v gutt"
   GUTT_REQUIRE_RESTART=1
   return 0
 }
 
-gutt_path_add_managed_block() {
-  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-    msgbox "Per-user install. Run GUTT as your normal user."
-    return 0
-  fi
-
-  # Adds a managed PATH block to ensure ~/.local/bin is on PATH.
-  # Idempotent: does nothing if the block already exists.
-  local rcfile sh rc
-
-  sh="$(gutt_detect_user_shell)"
-  rcfile="$(gutt_path_rc_file_for_shell)"
-
-  if ! yesno "🧭 Add ~/.local/bin to PATH\n\nShell: $sh\nConfig file: $rcfile\n\nAdd a managed block to ensure 'gutt' can be found in new terminals?"; then
-    return 0
-  fi
-
-  if gutt_path_managed_block_present "$rcfile"; then
-    msgbox "✅ Managed PATH block already present.\n\nFile:\n$rcfile"
-    return 0
-  fi
-
-  set +e
-  mkdir -p -- "$(dirname -- "$rcfile")" 2>/dev/null
-  touch -- "$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-
-  if [[ $rc -ne 0 ]]; then
-    msgbox "❌ Failed to prepare config file (rc=$rc).\n\nFile:\n$rcfile"
-    return 0
-  fi
-
-  set +e
-  {
-    printf '\n# >>> GUTT PATH >>>\n'
-    printf 'export PATH="$HOME/.local/bin:$PATH"\n'
-    printf '# <<< GUTT PATH <<<\n'
-  } >>"$rcfile" 2>/dev/null
-  rc=$?
-  set -e
-
-  if [[ $rc -ne 0 ]]; then
-    msgbox "❌ Failed to write PATH block (rc=$rc).\n\nFile:\n$rcfile"
-    return 0
-  fi
-
-  msgbox "✅ Added managed PATH block.\n\nFile:\n$rcfile\n\nOpen a new terminal (or source the file) and try:\n  command -v gutt\n  gutt"
-  return 0
-}
-
 gutt_manage_path_menu() {
-  local found p rp ours
-  local status_label cmd_path
+  # Requirement: if whiptail is missing/fails, print status and exit visibly.
+  if ! command -v whiptail >/dev/null 2>&1; then
+    printf '\n[PATH integration] whiptail not found.\n' >/dev/tty
+    gutt_path_status_plain
+    printf '\nCannot open menu without whiptail.\n\n' >/dev/tty
+    return 0
+  fi
 
   while true; do
-local state
-state="$(gutt_path_integration_state)"
+    local label choice
+    label="$(gutt_path_integration_label)"
 
-status_label="Not installed"
-cmd_path="not found"
-
-case "$state" in
-  INSTALLED)
-    status_label="Installed (this GUTT)"
-    cmd_path="$(command -v gutt 2>/dev/null || echo "gutt")"
-    ;;
-  FOREIGN)
-    status_label="Foreign command"
-    cmd_path="$(command -v gutt 2>/dev/null || echo "gutt")"
-    ;;
-  PARTIAL)
-    status_label="Wrapper present (NOT on PATH)"
-    if [[ -x "$HOME/.local/bin/gutt" ]]; then
-      cmd_path="$HOME/.local/bin/gutt"
-    elif [[ -x "$HOME/bin/gutt" ]]; then
-      cmd_path="$HOME/bin/gutt"
-    else
-      cmd_path="not found"
-    fi
-    ;;
-  UNINSTALLED|*)
-    status_label="Not installed"
-    cmd_path="not found"
-    ;;
-esac
-
-    local hdr
-    hdr=$'Status: '"$status_label"$'
-Command: '"$cmd_path"$'
-
-Choose an action:'
-
-    # Phase E: detect legacy/unmanaged PATH edits (report-first)
-    local sh rcfile health unmanaged warn
-    sh="$(gutt_detect_user_shell)"
-    rcfile="$(gutt_path_rc_file_for_shell)"
-    health="$(gutt_path_managed_block_health "$rcfile")"
-    unmanaged="$(gutt_path_scan_unmanaged_lines "$rcfile")"
-    warn=""
-    if [[ "$health" == "MULTIPLE" || "$health" == "MALFORMED" ]]; then
-      warn+=$'
-⚠ Managed PATH block markers need attention (run Scan).'
-    fi
-    if [[ -n "$unmanaged" ]]; then
-      warn+=$'
-⚠ Legacy/unmanaged .local/bin PATH edits detected (run Scan).'
-    fi
-    if [[ -n "$warn" ]]; then
-      hdr+="$warn"
-    fi
-
-    local usr_desc add_desc hint choice
-    usr_desc="Install/update user shortcut (~/.local/bin/gutt)"
-    add_desc="Add ~/.local/bin to PATH (managed block)"
-    hint=""
-
-    case "$state" in
-      INSTALLED)
-        usr_desc="Reinstall/update user shortcut (~/.local/bin/gutt)"
-        hint=$'\n\n✅ PATH already resolves gutt. You are good.'
-        ;;
-      PARTIAL)
-        add_desc="Add ~/.local/bin to PATH (fix PARTIAL state)"
-        hint=$'\n\nNext step: add ~/.local/bin to PATH so "gutt" works in new shells.'
-        ;;
-      FOREIGN)
-        usr_desc="Install user shortcut (~/.local/bin/gutt) (will not override foreign gutt)"
-        hint=$'\n\n⚠ A different "gutt" is on PATH. GUTT will not overwrite it.'
-        ;;
-      UNINSTALLED)
-        hint=$'\n\nTip: install the shortcut, then add ~/.local/bin to PATH if needed.'
-        ;;
-    esac
-
-    choice="$(menu "$APP_NAME $VERSION" "🔗 Manage PATH integration
-
-$hdr$hint" \
-      "USR"    "$usr_desc" \
-      "ADD"    "$add_desc" \
-      "SCAN"   "Scan shell config for legacy/unmanaged PATH edits" \
-      "REPAIR" "Repair managed PATH block (between markers)" \
-      "PURGE"  "Recovery: purge and rebuild managed PATH block" \
-      "REM"    "Remove shortcut (restart terminal)" \
-      "RMBLK"  "Remove managed PATH block (restart terminal)" \
-      "HOW"    "Show manual guidance" \
-      "BACK"   "Back")" || return 0
+    choice="$(menu "$APP_NAME $VERSION" "PATH integration\n\n$label\n\n(Definition: command -v gutt finds one symlink to this repo.)" \
+      "STAT" "Status (always safe)" \
+      "INST" "Install" \
+      "REM"  "Remove" \
+      "BACK" "Back")" || return 0
 
     case "$choice" in
-      USR) gutt_run_action gutt_shortcut_install_user ;;
-      ADD) gutt_run_action gutt_path_add_managed_block ;;
-      SCAN) gutt_run_action gutt_path_show_scan_report ;;
-      REPAIR) gutt_run_action gutt_path_repair_managed_block ;;
-      PURGE) gutt_run_action gutt_path_purge_and_rebuild_managed_block ;;
-      REM)
-        local rc=0
-        set +e
-        gutt_shortcut_remove
-        rc=$?
-        set -e
-        [[ $rc -eq 2 ]] && continue
-        ;;
-
-      RMBLK) gutt_run_action gutt_path_remove_managed_block ;;
-      HOW)
-        msgbox "Manual guidance (no writes)
-
-User install:
-  mkdir -p \"$HOME/.local/bin\"
-  install -m 0755 <this-file> \"$HOME/.local/bin/gutt\"
-
-If ~/.local/bin isn't on PATH:
-  export PATH=\"\$HOME/.local/bin:\$PATH\"
-
-Managed block (recommended):
-  # >>> GUTT PATH >>>
-  export PATH=\"\$HOME/.local/bin:\$PATH\"
-  # <<< GUTT PATH <<<"
-        ;;
+      STAT) gutt_run_action gutt_path_status ;;
+      INST) gutt_run_action gutt_path_install ;;
+      REM)  gutt_run_action gutt_path_remove ;;
       BACK) return 0 ;;
     esac
   done
