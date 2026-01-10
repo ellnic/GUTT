@@ -3,8 +3,10 @@
 
 set -Eeuo pipefail
 
-# Resolve this script dir (works even when invoked via symlink)
-__GUTT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# Resolve this script dir (also works when invoked via symlink)
+__GUTT_SELF="${BASH_SOURCE[0]}"
+__GUTT_SELF_REAL="$(readlink -f -- "$__GUTT_SELF" 2>/dev/null || echo "$__GUTT_SELF")"
+__GUTT_DIR="$(cd -- "$(dirname -- "$__GUTT_SELF_REAL")" && pwd -P)"
 
 # Load order contract (no other file should source another)
 # shellcheck source=/dev/null

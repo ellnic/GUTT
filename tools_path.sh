@@ -60,6 +60,30 @@ _gutt_is_symlink_to_entry() {
   [[ -n "$rp" && "$rp" == "$entry_real" ]]
 }
 
+_gutt_path_is_managed_location() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  case "$p" in
+    "/usr/local/bin/gutt"|"$HOME/.local/bin/gutt") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_gutt_stash_in_place() {
+  # Rename an existing entry (file or symlink) to a timestamped backup *in the same directory*.
+  # Never deletes.
+  local p="${1:-}" ts="${2:-}"
+  [[ -n "$p" ]] || return 1
+  [[ -e "$p" || -L "$p" ]] || return 1
+
+  local dir base bak
+  dir="$(dirname -- "$p")"
+  base="$(basename -- "$p")"
+  [[ -n "$ts" ]] || ts="$(date +%Y%m%d-%H%M%S)"
+  bak="${dir}/${base}.FOREIGN.${ts}.bak"
+  mv -v -- "$p" "$bak"
+}
+
 _gutt_path_status_compute() {
   # Emits:
   #   cmd_path|notfound
@@ -206,7 +230,19 @@ gutt_path_install() {
   local entry_real target target_dir
   entry_real="$(_gutt_entry_realpath)"
 
-  target="$(_gutt_first_writable_target || true)"
+  # If the current resolved command is in a managed location, prefer taking over that exact path.
+  # This avoids installing somewhere else while a foreign entry in PATH still shadows it.
+  local cur_cmd
+  cur_cmd="$(command -v gutt 2>/dev/null || true)"
+  if _gutt_path_is_managed_location "$cur_cmd"; then
+    local cur_dir
+    cur_dir="$(dirname -- "$cur_cmd")"
+    if [[ -d "$cur_dir" && -w "$cur_dir" ]]; then
+      target="$cur_cmd"
+    fi
+  fi
+
+  [[ -n "${target:-}" ]] || target="$(_gutt_first_writable_target || true)"
   if [[ -z "$target" ]]; then
     msgbox "❌ No writable install location found.\n\nTried:\n- /usr/local/bin/gutt (needs write access)\n- $HOME/.local/bin/gutt (needs write access)\n\nGUTT will not modify PATH or shell rc files."
     return 0
@@ -219,7 +255,7 @@ gutt_path_install() {
     mkdir -p -- "$target_dir" 2>/dev/null || true
   fi
 
-  # Preflight existing
+  # Preflight existing (safe takeover)
   if [[ -e "$target" || -L "$target" ]]; then
     if _gutt_is_symlink_to_entry "$target" "$entry_real"; then
       msgbox "✅ Already installed.\n\n$target -> $entry_real"
@@ -233,8 +269,30 @@ gutt_path_install() {
       existing_target="$(readlink -f -- "$target" 2>/dev/null || true)"
     fi
 
-    msgbox "⚠ Refusing to overwrite existing entry.\n\nPath: $target\nType: $what\nSymlink target: ${existing_target:-n/a}\n\nWanted: symlink to\n  $entry_real"
-    return 0
+    local msg
+    msg="⚠ A foreign PATH entry exists in a managed location.\n\n"
+    msg+="Path: $target\nType: $what\n"
+    msg+="Symlink target: ${existing_target:-n/a}\n\n"
+    msg+="GUTT will NEVER delete it.\n\n"
+    msg+="Recommended: stash (rename) it in-place, then install the managed symlink:\n\n"
+    msg+="  $target -> $entry_real\n\n"
+    msg+="Stash and install?"
+
+    if ! yesno "$msg"; then
+      return 2
+    fi
+
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    local rc=0
+    set +e
+    _gutt_stash_in_place "$target" "$ts" >/dev/tty 2>/dev/tty
+    rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      msgbox "❌ Failed to stash existing entry (rc=$rc).\n\nPath:\n  $target"
+      return 0
+    fi
   fi
 
   if ! yesno "🔗 Install PATH integration\n\nCreate symlink:\n  $target\n-> $entry_real\n\nProceed?"; then
@@ -265,15 +323,50 @@ gutt_path_remove() {
   while IFS= read -r t; do targets+=("$t"); done < <(_gutt_install_locations)
 
   local matches=()
+  local foreign=()
   local t
   for t in "${targets[@]}"; do
     if _gutt_is_symlink_to_entry "$t" "$entry_real"; then
       matches+=("$t")
+    elif [[ -e "$t" || -L "$t" ]]; then
+      foreign+=("$t")
     fi
   done
 
   if [[ ${#matches[@]} -eq 0 ]]; then
-    msgbox "Nothing to remove.\n\nNo matching symlink found in:\n- /usr/local/bin/gutt\n- $HOME/.local/bin/gutt"
+    if [[ ${#foreign[@]} -eq 0 ]]; then
+      msgbox "Nothing to remove.\n\nNo matching symlink found in:\n- /usr/local/bin/gutt\n- $HOME/.local/bin/gutt"
+      return 0
+    fi
+
+    local msg="⚠ PATH integration appears foreign in a managed location.\n\n"
+    msg+="GUTT will NEVER delete foreign entries.\n\n"
+    msg+="It can stash (rename) the following so you can Install cleanly:\n"
+    for t in "${foreign[@]}"; do
+      msg+="  - $t\n"
+    done
+    msg+="\nStash these entries?"
+
+    if ! yesno "$msg"; then
+      return 2
+    fi
+
+    local ts rc=0
+    ts="$(date +%Y%m%d-%H%M%S)"
+    for t in "${foreign[@]}"; do
+      set +e
+      _gutt_stash_in_place "$t" "$ts" >/dev/tty 2>/dev/tty
+      rc=$?
+      set -e
+      if [[ $rc -ne 0 ]]; then
+        msgbox "❌ Failed to stash (rc=$rc):\n\n$t"
+        return 0
+      fi
+    done
+
+    hash -r 2>/dev/null || true
+    msgbox "✅ Stashed foreign entries.\n\nPATH integration is now not installed.\n\nYou can now choose Install."
+    GUTT_REQUIRE_RESTART=1
     return 0
   fi
 
